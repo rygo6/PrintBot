@@ -1,0 +1,132 @@
+# Maps OBN_CLIENT_TYPE to client-specific install settings.
+#
+# The plugin's source code does not change between clients — they all load
+# the same C ABI from the same .so. What differs is the slicer's plugin-
+# loader convention, the OTA manifest scheme, and the conf file we patch
+# at install time:
+#
+#   bambu_studio
+#     - dlopens "<data_dir>/plugins/libbambu_networking.so" by fixed name
+#     - reads the cached version from
+#       <data_dir>/ota/plugins/network_plugins.json before deciding
+#       whether to redownload from the cloud
+#     - first-time install needs "installed_networking" / "update_network_plugin"
+#       toggled in BambuStudio.conf
+#
+#   orca_slicer
+#     - dlopens "<data_dir>/plugins/libbambu_networking_<network_plugin_version>.so"
+#       — the version is part of the file name, so we ship a renamed copy
+#     - does NOT read network_plugins.json on startup; that file is only
+#       a transient artefact dropped by an OTA update flow and deleted
+#       afterwards (see PresetUpdater.cpp). Skip it entirely on install.
+#     - first-time install needs installed_networking=true,
+#       network_plugin_version=<OBN_VERSION>, network_plugin_remind_later
+#       set, and our version stripped from network_plugin_skipped_versions
+#       in OrcaSlicer.conf
+#
+# obn_resolve_client(type) sets the following variables in the caller's
+# scope (PARENT_SCOPE):
+#
+#   OBN_CLIENT_PLUGIN_NAME
+#       Base name of the libbambu_networking shared object on disk
+#       (without "lib" prefix or ".so" suffix). Studio: "bambu_networking";
+#       Orca: "bambu_networking_<OBN_VERSION>".
+#
+#   OBN_CLIENT_INSTALL_OTA
+#       TRUE if network_plugins.json should be installed at all.
+#       Only Studio uses it as a persistent manifest; Orca does not.
+#
+#   OBN_CLIENT_OTA_SUBPATH
+#       Relative install dir for network_plugins.json when OBN_CLIENT_INSTALL_OTA
+#       is TRUE. Studio expects "ota/plugins". Empty otherwise.
+#
+#   OBN_CLIENT_CONF_PATCH_SCRIPT
+#       Absolute path to the .cmake.in template used by install(SCRIPT) to
+#       patch the slicer's conf file. configure_file() expands @VAR@
+#       references against the current CMake variables.
+#
+#   OBN_CLIENT_CONF_NAME
+#       File name of the slicer's conf file ("BambuStudio.conf" or
+#       "OrcaSlicer.conf"). Used by the patch script template.
+#
+#   OBN_CLIENT_DEFAULT_PREFIX
+#       Recommended default install prefix: native config dir per OS (Linux
+#       ~/.config or Flatpak fallback; macOS Library/Application Support;
+#       Windows %APPDATA%). Empty when the platform has no convention or
+#       $HOME / APPDATA is unset.
+
+function(obn_resolve_client client_type)
+    if(NOT client_type STREQUAL "bambu_studio" AND
+       NOT client_type STREQUAL "orca_slicer")
+        message(FATAL_ERROR
+            "obn_resolve_client: unknown client_type '${client_type}'. "
+            "Must be 'bambu_studio' or 'orca_slicer'.")
+    endif()
+
+    set(_module_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}")
+
+    if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
+        set(_home "$ENV{HOME}")
+    else()
+        set(_home "")
+    endif()
+
+    # Windows: prefer %APPDATA% (Roaming), which is what Bambu Studio uses
+    # for wxStandardPaths::Get().GetUserDataDir() -- e.g.
+    # C:\Users\<user>\AppData\Roaming\BambuStudio. Convert to forward slashes
+    # via file(TO_CMAKE_PATH) so install rules and string compares behave.
+    set(_appdata "")
+    if(WIN32 AND DEFINED ENV{APPDATA} AND NOT "$ENV{APPDATA}" STREQUAL "")
+        file(TO_CMAKE_PATH "$ENV{APPDATA}" _appdata)
+    endif()
+
+    if(client_type STREQUAL "bambu_studio")
+        set(OBN_CLIENT_PLUGIN_NAME       "bambu_networking"                          PARENT_SCOPE)
+        set(OBN_CLIENT_INSTALL_OTA       TRUE                                         PARENT_SCOPE)
+        set(OBN_CLIENT_OTA_SUBPATH       "ota/plugins"                                PARENT_SCOPE)
+        set(OBN_CLIENT_CONF_PATCH_SCRIPT "${_module_dir}/patch_bambustudio_conf.cmake.in" PARENT_SCOPE)
+        set(OBN_CLIENT_CONF_NAME         "BambuStudio.conf"                           PARENT_SCOPE)
+        set(_client_native  "${_home}/.config/BambuStudio")
+        set(_client_flatpak "${_home}/.var/app/com.bambulab.BambuStudio/config/BambuStudio")
+        set(_client_appdata "${_appdata}/BambuStudio")
+        set(_client_mac     "${_home}/Library/Application Support/BambuStudio")
+    else() # orca_slicer
+        if(NOT DEFINED OBN_VERSION OR OBN_VERSION STREQUAL "")
+            message(FATAL_ERROR
+                "obn_resolve_client(orca_slicer): OBN_VERSION must be set "
+                "before calling obn_resolve_client (it is part of the .so/.dll file name).")
+        endif()
+        set(OBN_CLIENT_PLUGIN_NAME       "bambu_networking_${OBN_VERSION}"            PARENT_SCOPE)
+        set(OBN_CLIENT_INSTALL_OTA       FALSE                                        PARENT_SCOPE)
+        set(OBN_CLIENT_OTA_SUBPATH       ""                                           PARENT_SCOPE)
+        set(OBN_CLIENT_CONF_PATCH_SCRIPT "${_module_dir}/patch_orcaslicer_conf.cmake.in" PARENT_SCOPE)
+        set(OBN_CLIENT_CONF_NAME         "OrcaSlicer.conf"                            PARENT_SCOPE)
+        set(_client_native  "${_home}/.config/OrcaSlicer")
+        set(_client_flatpak "${_home}/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer")
+        set(_client_appdata "${_appdata}/OrcaSlicer")
+        set(_client_mac     "${_home}/Library/Application Support/OrcaSlicer")
+    endif()
+
+    if(WIN32 AND NOT _appdata STREQUAL "")
+        # Windows install layout matches Studio's NetworkAgent::initialize_
+        # network_module: <data_dir>\plugins\bambu_networking.dll, with
+        # <data_dir> == %APPDATA%\BambuStudio (or \OrcaSlicer). No Flatpak
+        # equivalent on Windows.
+        set(OBN_CLIENT_DEFAULT_PREFIX     "${_client_appdata}" PARENT_SCOPE)
+    elseif(APPLE AND NOT _home STREQUAL "")
+        # wx StandardPaths::GetUserDataDir() on macOS (not ~/.config).
+        set(OBN_CLIENT_DEFAULT_PREFIX     "${_client_mac}" PARENT_SCOPE)
+    elseif(UNIX AND NOT APPLE AND NOT _home STREQUAL "")
+        # Native preferred; Flatpak only as a fallback when native is missing.
+        # Mirrors the priority in ./configure. Same shape for both clients.
+        if(IS_DIRECTORY "${_client_native}")
+            set(OBN_CLIENT_DEFAULT_PREFIX "${_client_native}"  PARENT_SCOPE)
+        elseif(IS_DIRECTORY "${_client_flatpak}")
+            set(OBN_CLIENT_DEFAULT_PREFIX "${_client_flatpak}" PARENT_SCOPE)
+        else()
+            set(OBN_CLIENT_DEFAULT_PREFIX "${_client_native}"  PARENT_SCOPE)
+        endif()
+    else()
+        set(OBN_CLIENT_DEFAULT_PREFIX     ""  PARENT_SCOPE)
+    endif()
+endfunction()

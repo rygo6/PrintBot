@@ -1,0 +1,705 @@
+// Classifies, signs, and wraps outbound MQTT payloads.
+// Only {"print":{...}} messages receive an envelope; all others pass through.
+// Envelope: {"header":{"cert_id":"...","payload_len":N,"sign_alg":"RSA_SHA256",
+//            "sign_string":"...","sign_ver":"v1.0"},"print":{...sorted keys...}}
+
+#include "obn/signing.hpp"
+#include "obn/config.hpp"
+#include "obn/json_lite.hpp"
+#include "obn/log.hpp"
+
+#include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace obn::signing {
+
+namespace {
+
+struct PkeyDel { void operator()(EVP_PKEY*     p) const { EVP_PKEY_free(p); } };
+struct MdDel   { void operator()(EVP_MD_CTX*   p) const { EVP_MD_CTX_free(p); } };
+struct CtxDel  { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+struct X509Del { void operator()(X509*         p) const { X509_free(p); } };
+struct BnDel   { void operator()(BIGNUM*       p) const { BN_free(p); } };
+
+static constexpr const char kSignAlg[] = "RSA_SHA256";
+static constexpr const char kSignVer[] = "v1.0";
+
+// Resolve the key file path: obn.conf slicer_key_pem, or
+// config_dir/slicer_key.pem when empty.
+static std::string resolve_key_path()
+{
+    const auto& cfg = obn::config::current().slicer_key_pem;
+    if (!cfg.empty()) return cfg;
+    return obn::config::path_in_dir("slicer_key.pem");
+}
+
+// Reads a whole file into a string. "" on any failure. `path` is an absolute
+// or config-relative path already resolved by the caller.
+static std::string read_pem_file(const std::string& path)
+{
+    if (path.empty()) return {};
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::string out;
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+} // namespace
+
+std::string slicer_cert_pem()
+{
+    const auto& cfg = obn::config::current().slicer_cert_pem;
+    return read_pem_file(cfg.empty() ? obn::config::path_in_dir("slicer_cert.pem")
+                                     : cfg);
+}
+
+std::string slicer_crl_pem()
+{
+    const auto& cfg = obn::config::current().slicer_crl_pem;
+    return read_pem_file(cfg.empty() ? obn::config::path_in_dir("slicer_crl.pem")
+                                     : cfg);
+}
+
+namespace {
+
+// Leaf of slicer_cert.pem (first PEM block). nullptr when absent/unparseable.
+static std::unique_ptr<X509, X509Del> load_slicer_leaf_cert()
+{
+    const std::string pem = slicer_cert_pem();
+    if (pem.empty()) return nullptr;
+    BIO* bio = ::BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) return nullptr;
+    X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    ::BIO_free(bio);
+    return std::unique_ptr<X509, X509Del>(cert);
+}
+
+static std::string leaf_serial_hex_lower(X509* cert)
+{
+    const ASN1_INTEGER* sn = ::X509_get_serialNumber(cert);
+    if (!sn) return {};
+    std::unique_ptr<BIGNUM, BnDel> bn(::ASN1_INTEGER_to_BN(sn, nullptr));
+    if (!bn) return {};
+    char* hex = ::BN_bn2hex(bn.get());
+    if (!hex) return {};
+    std::string serial(hex);
+    ::OPENSSL_free(hex);
+    for (char& c : serial)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // Wire form uses an even number of hex digits (byte-aligned).
+    if (serial.size() % 2)
+        serial.insert(serial.begin(), '0');
+    return serial;
+}
+
+static std::string leaf_issuer_rfc2253(X509* cert)
+{
+    X509_NAME* name = ::X509_get_issuer_name(cert);
+    if (!name) return {};
+    BIO* bio = ::BIO_new(::BIO_s_mem());
+    if (!bio) return {};
+    if (::X509_NAME_print_ex(bio, name, 0, XN_FLAG_RFC2253) < 0) {
+        ::BIO_free(bio);
+        return {};
+    }
+    char* data = nullptr;
+    const long len = ::BIO_get_mem_data(bio, &data);
+    std::string issuer;
+    if (data && len > 0)
+        issuer.assign(data, static_cast<std::size_t>(len));
+    ::BIO_free(bio);
+    return issuer;
+}
+
+// MQTT cert_id = serial+issuer; HTTP = issuer:serial. Cached under
+// g_cache_mu; dropped by invalidate_cache() after a credential refresh.
+struct AppCertIds {
+    std::string mqtt;
+    std::string http;
+};
+
+// --- Credential caches, guarded by g_cache_mu. --------------------------
+// g_cached_key loads lazily on first use. invalidate_cache() (called by the
+// app-cert fetch after it writes refreshed files) MOVES a replaced key into
+// g_retired_keys instead of freeing it: slicer_pkey() hands out raw
+// pointers and an in-flight signature may still be using the old object
+// while the fetch thread swaps the material.
+static std::mutex                          g_cache_mu;
+static std::unique_ptr<EVP_PKEY, PkeyDel>  g_cached_key;
+static std::vector<std::unique_ptr<EVP_PKEY, PkeyDel>> g_retired_keys;
+static bool                                g_key_loaded = false;
+static std::shared_ptr<const AppCertIds>   g_app_cert_ids;
+
+// Caller must hold g_cache_mu.
+static std::shared_ptr<const AppCertIds> app_cert_ids_locked()
+{
+    if (!g_app_cert_ids) {
+        auto ids = std::make_shared<AppCertIds>();
+        if (auto cert = load_slicer_leaf_cert()) {
+            const std::string serial = leaf_serial_hex_lower(cert.get());
+            const std::string issuer = leaf_issuer_rfc2253(cert.get());
+            if (!serial.empty() && !issuer.empty()) {
+                ids->mqtt = serial + issuer;
+                ids->http = issuer + ":" + serial;
+            }
+        }
+        g_app_cert_ids = std::move(ids);
+    }
+    return g_app_cert_ids;
+}
+
+} // namespace
+
+// cert_id identifies the slicer's registered signing certificate on Bambu's
+// backend. Derived from the leaf of slicer_cert.pem:
+//   lowercase_hex(serial) + issuer_RFC2253  (no separator).
+std::string slicer_cert_id()
+{
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    return app_cert_ids_locked()->mqtt;
+}
+
+// HTTP x-bbl-app-certification-id: issuer_RFC2253 + ":" + serial.lower(),
+// from the same leaf parse as slicer_cert_id().
+std::string app_certification_id()
+{
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    return app_cert_ids_locked()->http;
+}
+
+namespace {
+
+static std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey()
+{
+    std::string path = resolve_key_path();
+    if (path.empty()) return nullptr;
+
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return nullptr;
+
+    EVP_PKEY* raw = PEM_read_PrivateKey(f, nullptr, nullptr, nullptr);
+    std::fclose(f);
+
+    return std::unique_ptr<EVP_PKEY, PkeyDel>(raw);
+}
+
+EVP_PKEY* slicer_pkey()
+{
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    if (!g_key_loaded) {
+        g_cached_key = load_pkey();
+        g_key_loaded = true;
+    }
+    return g_cached_key.get();
+}
+
+
+// RSA-PKCS#1 v1.5 + SHA-256 over `data`, returned as base64.
+std::string rsa_sha256_sign_b64(EVP_PKEY* pkey,
+                                 const unsigned char* data, std::size_t len)
+{
+    if (!pkey) return {};
+    std::unique_ptr<EVP_MD_CTX, MdDel> ctx(EVP_MD_CTX_new());
+    if (!ctx) throw std::runtime_error("signing: EVP_MD_CTX_new failed");
+    if (EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr, pkey) != 1)
+        throw std::runtime_error("signing: EVP_DigestSignInit failed");
+    if (EVP_DigestSignUpdate(ctx.get(), data, len) != 1)
+        throw std::runtime_error("signing: EVP_DigestSignUpdate failed");
+    std::size_t siglen = 0;
+    if (EVP_DigestSignFinal(ctx.get(), nullptr, &siglen) != 1 || siglen == 0)
+        throw std::runtime_error("signing: EVP_DigestSignFinal (size query) failed");
+    std::vector<unsigned char> sig(siglen);
+    if (EVP_DigestSignFinal(ctx.get(), sig.data(), &siglen) != 1)
+        throw std::runtime_error("signing: EVP_DigestSignFinal failed");
+    return base64_encode(sig.data(), siglen);
+}
+
+// Raw RSA PKCS#1 v1.5 signature over `data` — the data IS the signed message,
+// NOT its hash. Unlike rsa_sha256_sign_b64, no digest is applied and no
+// DigestInfo is prepended: the encoded block is 00 01 FF..FF 00 || data.
+// Returned as base64.
+std::string rsa_pkcs1_sign_raw_b64(EVP_PKEY* pkey,
+                                   const unsigned char* data, std::size_t len)
+{
+    if (!pkey) return {};
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(pkey, nullptr));
+    if (!ctx) throw std::runtime_error("signing: EVP_PKEY_CTX_new failed");
+    if (EVP_PKEY_sign_init(ctx.get()) != 1)
+        throw std::runtime_error("signing: EVP_PKEY_sign_init failed");
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) != 1)
+        throw std::runtime_error("signing: set_rsa_padding failed");
+    std::size_t siglen = 0;
+    if (EVP_PKEY_sign(ctx.get(), nullptr, &siglen, data, len) != 1 || siglen == 0)
+        throw std::runtime_error("signing: EVP_PKEY_sign (size query) failed");
+    std::vector<unsigned char> sig(siglen);
+    if (EVP_PKEY_sign(ctx.get(), sig.data(), &siglen, data, len) != 1)
+        throw std::runtime_error("signing: EVP_PKEY_sign failed");
+    return base64_encode(sig.data(), siglen);
+}
+
+// Returns "print", "liveview" (only for prepare commands), or empty if neither.
+std::string signable_root_key(const std::string& payload) noexcept
+{
+    const char* p   = payload.data();
+    const char* end = p + payload.size();
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    if (p >= end || *p != '{') return {};
+    ++p;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    if (p >= end || *p != '"') return {};
+    ++p;
+    const char* kstart = p;
+    while (p < end && *p != '"') ++p;
+    if (p >= end) return {};
+    std::string key(kstart, p - kstart);
+    if (key == "print") return key;
+    if (key == "liveview") {
+        if (payload.find("\"prepare\"") != std::string::npos) return key;
+    }
+    return {};
+}
+
+// The one field each command carries as device-cert ciphertext
+// (research/10.03): project_file's model url, gcode_line's raw G-code,
+// prepare's liveview ttcode.
+// project_file's `param` is the plate path the firmware reads in cleartext;
+// encrypting (and dropping) it makes the printer fail with 0500-4003
+// (cannot parse file).
+const char* encrypted_field_for(const obn::json::Object& obj)
+{
+    auto cmd = obj.find("command");
+    if (cmd == obj.end() || !cmd->second.is_string()) return nullptr;
+    const std::string c = cmd->second.as_string();
+    if (c == "project_file") return "url";
+    if (c == "gcode_line")   return "param";
+    if (c == "prepare")      return "ttcode";
+    return nullptr;
+}
+
+// Applies device-cert field encryption to the parsed `print` object in place:
+// adds `<field>_enc` (RSA). On a secured printer (`developer_mode == false`)
+// the cleartext field is then DROPPED, because secured firmware reads only
+// *_enc and rejects a message carrying both (gcode_line -> err 84033545
+// "mqtt message verify failed"; research/§10.3). When `developer_mode == true`
+// the cleartext is kept, because Developer Mode firmware ignores *_enc and
+// reads the cleartext instead. The caller derives `developer_mode` per printer
+// from push_status print.fun bit 29 (Agent::developer_mode_effective).
+// Idempotent when `*_enc` already exists. Without a device key (or when RSA
+// fails) logs ERROR and leaves the cleartext.
+void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub,
+                          bool developer_mode)
+{
+    const char* field = encrypted_field_for(obj);
+    if (!field) return;
+    const std::string enc_key = std::string(field) + "_enc";
+    auto it = obj.find(field);
+    if (it == obj.end() || !it->second.is_string() || obj.count(enc_key)) return;
+    if (!device_pub) {
+        OBN_ERROR("no device public key; leaving %s cleartext "
+                  "(printer will reject if secured)", field);
+        return;
+    }
+    std::string enc_err;
+    std::string enc = rsa_pkcs1v15_encrypt_b64(device_pub, it->second.as_string(),
+                                               &enc_err);
+    if (enc.empty()) {
+        OBN_ERROR("RSA encrypt of '%s' failed: %s; leaving cleartext",
+                  field, enc_err.empty() ? "unknown" : enc_err.c_str());
+        return;
+    }
+    obj[enc_key] = obn::json::Value(std::move(enc));
+    if (!developer_mode)
+        obj.erase(it);
+}
+
+// Builds the command dump ({...sorted keys...}) after optional field encryption.
+// Uses json_lite, whose Object type is std::map, so dump() already sorts keys.
+std::string build_command_dump(const std::string& root_key,
+                               const std::string& payload,
+                               EVP_PKEY*          device_pub,
+                               bool               developer_mode)
+{
+    auto root = obn::json::parse(payload);
+    if (!root) return {};
+    const obn::json::Value& cmd = root->find(root_key.c_str());
+    if (cmd.kind() != obn::json::Value::Kind::Object) return {};
+    obn::json::Object obj = cmd.as_object(); // copy for mutation
+    encrypt_print_fields(obj, device_pub, developer_mode);
+    return obn::json::Value(std::move(obj)).dump();
+}
+
+// Escapes backslash and double-quote for embedding inside a JSON string
+// literal whose surrounding quotes are managed by the caller.
+static std::string json_str_escape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\\' || c == '"') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+// Emits {"header":…,"<root_key>":<body>} where <body> is the envelope-minus-
+// header INCLUDING any trailing top-level siblings (the caller passes the same
+// `body` string it signed — one string feeds both). See the invariant comment
+// at to_sign (maybe_sign) below, locked by test_trailing_sibling_reconstruction
+// in tests/signing_test.cpp.
+// Builds the complete signed envelope JSON string.
+std::string build_envelope(const std::string& to_sign,
+                           const std::string& sig_b64,
+                           const std::string& root_key,
+                           const std::string& dump)
+{
+    std::string out;
+    out.reserve(to_sign.size() + sig_b64.size() + 200);
+    out += "{\"header\":{\"cert_id\":\"";
+    out += json_str_escape(slicer_cert_id());
+    out += "\",\"payload_len\":";
+    out += std::to_string(to_sign.size());
+    out += ",\"sign_alg\":\"";
+    out += kSignAlg;
+    out += "\",\"sign_string\":\"";
+    out += json_str_escape(sig_b64);
+    out += "\",\"sign_ver\":\"";
+    out += kSignVer;
+    out += "\"},\"" + root_key + "\":";
+    out += dump;
+    out += '}';
+    return out;
+}
+
+} // namespace
+
+bool would_sign(const std::string& payload_json)
+{
+    return !signable_root_key(payload_json).empty() && slicer_pkey() != nullptr;
+}
+
+bool needs_signing_key(const std::string& payload_json)
+{
+    return !signable_root_key(payload_json).empty();
+}
+
+void invalidate_cache()
+{
+    std::lock_guard<std::mutex> lk(g_cache_mu);
+    if (g_cached_key)
+        g_retired_keys.push_back(std::move(g_cached_key));
+    g_cached_key.reset();
+    g_key_loaded = false;
+    g_app_cert_ids.reset();
+}
+
+bool slicer_signing_key_present()
+{
+    return slicer_pkey() != nullptr;
+}
+
+std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
+                       bool developer_mode)
+{
+    const std::string root_key = signable_root_key(payload_json);
+    if (root_key.empty()) return payload_json;
+
+    EVP_PKEY* pkey = slicer_pkey();
+    if (!pkey) return payload_json;
+
+    const std::string dump =
+        build_command_dump(root_key, payload_json, device_pub, developer_mode);
+    if (dump.empty()) return payload_json; // malformed; pass through
+
+    // Trailing siblings (e.g. "user_id" after the root) are part of the signed
+    // envelope-minus-header per the farm consensus (research/10.04 §Signing
+    // consensus). Re-emit every other top-level entry AFTER the root (family
+    // key first; the remaining top-level keys follow in json_lite map
+    // (lexicographic) order). Zero siblings -> empty string -> byte-exact
+    // legacy wire.
+    std::string siblings;
+    {
+        auto root_val = obn::json::parse(payload_json); // parse succeeded above
+        if (root_val && root_val->is_object()) {
+            for (const auto& kv : root_val->as_object()) {
+                if (kv.first == root_key) continue;
+                siblings += ',';
+                siblings += obn::json::Value(kv.first).dump(); // quoted+escaped key
+                siblings += ':';
+                siblings += kv.second.dump();
+            }
+        }
+    }
+    const std::string body = dump + siblings; // envelope-minus-header
+
+    // SINGLE-BODY INVARIANT (locked by test_trailing_sibling_reconstruction in
+    // tests/signing_test.cpp): to_sign is exactly {"<root_key>":<body>} — the
+    // wire envelope with the header removed, trailing siblings included.
+    // ONE `body` string feeds both to_sign and build_envelope, so payload_len
+    // == bytes signed == wire bytes. Sibling order is specified and stable:
+    // the root key comes first regardless of alphabet, then the remaining
+    // top-level keys in json_lite map (lexicographic) order — byte-identical
+    // between the signed string and the wire envelope because both derive from
+    // the single body string. Zero siblings collapse to the exact legacy
+    // concatenation, so sibling-less payloads stay byte-exact.
+    const std::string to_sign = "{\"" + root_key + "\":" + body + "}";
+
+    const std::string sig_b64 = rsa_sha256_sign_b64(
+        pkey,
+        reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
+
+    return build_envelope(to_sign, sig_b64, root_key, body);
+}
+
+std::string sign_bytes(const std::string& data)
+{
+    EVP_PKEY* pkey = slicer_pkey();
+    if (!pkey) {
+        const auto& d = obn::config::dir();
+        throw std::runtime_error(
+            "signing: no key loaded; set slicer_key_pem in obn.conf "
+            "or place slicer_key.pem in the config directory ("
+            + (d.empty() ? "<not set>" : d) + ")");
+    }
+    return rsa_sha256_sign_b64(
+        pkey,
+        reinterpret_cast<const unsigned char*>(data.data()), data.size());
+}
+
+std::string device_security_sign()
+{
+    EVP_PKEY* pkey = slicer_pkey();
+    // Degrade gracefully when no slicer key is configured (same as maybe_sign):
+    // return empty so the caller omits the header rather than crashing the
+    // cloud-connect/print path. The header is only enforced on signed writes.
+    if (!pkey) return {};
+    // The proprietary plugin signs the *current* time in milliseconds (as a
+    // decimal string) with a raw RSA PKCS#1 v1.5 signature — no hash. The
+    // cloud recovers the timestamp from the signature and checks it is recent
+    // (replay protection).
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string ts = std::to_string(ms);
+    return rsa_pkcs1_sign_raw_b64(
+        pkey,
+        reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
+}
+
+// True when slicer_key.pem is the private key belonging to slicer_cert.pem.
+// A key and cert that do not belong together make x-bbl-device-security-sign
+// unverifiable, and the cloud then refuses the whole request (403 code 8)
+// rather than ignoring the header - worse than sending no PoP on printers
+// that do not require it.
+// Deliberately not cached: both files can land after process start
+// (ensure_app_cert_material_ fetches them on demand), and a one-shot false
+// would disable PoP for the whole session. Recompute per call - this runs
+// only on ttcode mints, and a mismatch is warned once.
+static bool slicer_key_matches_cert()
+{
+    EVP_PKEY* pkey = slicer_pkey();
+    auto cert = load_slicer_leaf_cert();
+    if (!pkey || !cert) return false;
+    const bool ok = X509_check_private_key(cert.get(), pkey) == 1;
+    if (!ok) {
+        static std::atomic<bool> mismatch_warned{false};
+        if (!mismatch_warned.exchange(true))
+            OBN_WARN("PoP: slicer_key.pem is not the private key for slicer_cert.pem; "
+                     "proof-of-possession headers will not be sent");
+    }
+    return ok;
+}
+
+bool add_pop_headers(std::map<std::string, std::string>& headers)
+{
+    if (!slicer_key_matches_cert()) return false;
+    const std::string& cert_id  = app_certification_id();
+    const std::string  sec_sign = device_security_sign();
+    if (cert_id.empty() || sec_sign.empty()) return false;
+    headers["x-bbl-app-certification-id"] = cert_id;
+    headers["x-bbl-device-security-sign"] = sec_sign;
+    return true;
+}
+
+// Blockwise RSA-PKCS#1 v1.5 encryption -> base64. Splits `plaintext` into
+// <=kMaxChunk-byte pieces so the total ciphertext is a concatenation of
+// key-sized blocks (matching the stock plugin's url_enc / param_enc form).
+std::string rsa_pkcs1v15_encrypt_b64(EVP_PKEY* pub, const std::string& plaintext,
+                                     std::string* err)
+{
+    if (!pub) {
+        if (err) *err = "null public key";
+        return {};
+    }
+
+    // PKCS#1 v1.5 max plaintext per block = RSA modulus bytes - 11.
+    const int key_bytes = EVP_PKEY_size(pub); // ciphertext block size (e.g. 256)
+    if (key_bytes <= 11) {
+        if (err) *err = "RSA key too small";
+        return {};
+    }
+    const std::size_t max_chunk = static_cast<std::size_t>(key_bytes - 11);
+
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(pub, nullptr));
+    if (!ctx) {
+        if (err) *err = "EVP_PKEY_CTX_new failed";
+        return {};
+    }
+    if (EVP_PKEY_encrypt_init(ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) <= 0) {
+        char ebuf[256];
+        ERR_error_string_n(ERR_peek_last_error(), ebuf, sizeof(ebuf));
+        if (err) *err = std::string("encrypt init/padding failed: ") + ebuf;
+        return {};
+    }
+
+    std::vector<unsigned char> out;
+    const auto* p = reinterpret_cast<const unsigned char*>(plaintext.data());
+    std::size_t remaining = plaintext.size();
+    std::size_t offset    = 0;
+    // A zero-length input still produces one block (the plugin never encrypts
+    // empty fields, but keep the loop robust rather than emit nothing).
+    do {
+        const std::size_t chunk = remaining < max_chunk ? remaining : max_chunk;
+        std::size_t block_len = 0;
+        if (EVP_PKEY_encrypt(ctx.get(), nullptr, &block_len, p + offset, chunk) <= 0) {
+            char ebuf[256];
+            ERR_error_string_n(ERR_peek_last_error(), ebuf, sizeof(ebuf));
+            if (err) *err = std::string("EVP_PKEY_encrypt size query failed: ") + ebuf;
+            return {};
+        }
+        const std::size_t base = out.size();
+        out.resize(base + block_len);
+        if (EVP_PKEY_encrypt(ctx.get(), out.data() + base, &block_len,
+                             p + offset, chunk) <= 0) {
+            char ebuf[256];
+            ERR_error_string_n(ERR_peek_last_error(), ebuf, sizeof(ebuf));
+            if (err) *err = std::string("EVP_PKEY_encrypt failed: ") + ebuf;
+            return {};
+        }
+        out.resize(base + block_len);
+        offset    += chunk;
+        remaining -= chunk;
+    } while (remaining > 0);
+
+    return base64_encode(out.data(), out.size());
+}
+
+static constexpr char kB64Tbl[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const unsigned char* data, std::size_t len)
+{
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (std::size_t i = 0; i < len; i += 3) {
+        std::uint32_t w = static_cast<std::uint32_t>(data[i]) << 16;
+        if (i + 1 < len) w |= static_cast<std::uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) w |= static_cast<std::uint32_t>(data[i + 2]);
+        out.push_back(kB64Tbl[(w >> 18) & 63]);
+        out.push_back(kB64Tbl[(w >> 12) & 63]);
+        out.push_back(i + 1 < len ? kB64Tbl[(w >> 6) & 63] : '=');
+        out.push_back(i + 2 < len ? kB64Tbl[w & 63] : '=');
+    }
+    return out;
+}
+
+bool slicer_app_cert_usable()
+{
+    // app_cert_install needs the app certificate PEM + CRL only (no private
+    // key). Defaults under config_dir count when obn.conf paths are empty.
+    // Soft date/revocation issues still return true (firmware accepts expired
+    // official CRLs); WARN once — Studio calls install_device_cert ~1 Hz.
+    static bool warned_cert_dates = false;
+    static bool warned_crl_dates = false;
+    static bool warned_revoked = false;
+
+    const std::string pem = slicer_cert_pem();
+    if (pem.empty()) return false;
+    const std::string crl_pem = slicer_crl_pem();
+    if (crl_pem.empty()) return false;
+
+    BIO* bio = ::BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) return false;
+    X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    ::BIO_free(bio);
+    if (!cert) {
+        OBN_ERROR("signing: slicer_cert.pem is not a valid X.509 certificate");
+        return false;
+    }
+
+    // notBefore must be in the past; notAfter must be in the future.
+    // X509_cmp_current_time: <0 if asn1_time is before now, >0 if after.
+    const ASN1_TIME* not_before = ::X509_get0_notBefore(cert);
+    const ASN1_TIME* not_after  = ::X509_get0_notAfter(cert);
+    const bool not_yet = not_before && ::X509_cmp_current_time(not_before) > 0;
+    const bool expired = !not_after || ::X509_cmp_current_time(not_after) < 0;
+    if ((not_yet || expired) && !warned_cert_dates) {
+        warned_cert_dates = true;
+        OBN_WARN("signing: slicer app certificate is %s "
+                 "(still usable for app_cert_install)",
+                 expired ? "expired" : "not yet valid");
+    }
+
+    BIO* crl_bio = ::BIO_new_mem_buf(crl_pem.data(),
+                                     static_cast<int>(crl_pem.size()));
+    if (!crl_bio) {
+        ::X509_free(cert);
+        return false;
+    }
+    X509_CRL* crl = ::PEM_read_bio_X509_CRL(crl_bio, nullptr, nullptr, nullptr);
+    ::BIO_free(crl_bio);
+    if (!crl) {
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer_crl.pem is not a valid X.509 CRL");
+        return false;
+    }
+
+    // lastUpdate (thisUpdate) must be in the past; nextUpdate, when present,
+    // must be in the future. Missing nextUpdate is treated as still valid —
+    // some CRLs omit it; request_app_cert_install still needs the PEM.
+    // Official Bambu CRLs are often past nextUpdate; printer still accepts them.
+    const ASN1_TIME* last_update = ::X509_CRL_get0_lastUpdate(crl);
+    const ASN1_TIME* next_update = ::X509_CRL_get0_nextUpdate(crl);
+    const bool crl_not_yet = last_update && ::X509_cmp_current_time(last_update) > 0;
+    const bool crl_expired = next_update && ::X509_cmp_current_time(next_update) < 0;
+    if ((crl_not_yet || crl_expired) && !warned_crl_dates) {
+        warned_crl_dates = true;
+        OBN_WARN("signing: slicer app CRL is %s "
+                 "(still usable for app_cert_install; firmware ignores nextUpdate)",
+                 crl_expired ? "expired" : "not yet valid");
+    }
+
+    // Soft-warn if this leaf appears on the CRL (still allow install).
+    X509_REVOKED* revoked = nullptr;
+    if (::X509_CRL_get0_by_cert(crl, &revoked, cert) == 1 && !warned_revoked) {
+        warned_revoked = true;
+        OBN_WARN("signing: slicer app certificate is revoked on slicer_crl.pem "
+                 "(still usable for app_cert_install)");
+    }
+
+    ::X509_CRL_free(crl);
+    ::X509_free(cert);
+    return true;
+}
+
+} // namespace obn::signing

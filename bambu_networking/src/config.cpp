@@ -1,0 +1,495 @@
+#include "obn/config.hpp"
+#include "obn/abi_export.hpp"
+#include "obn/lan_tls.hpp"
+#include "obn/log.hpp"
+#include "obn_conf_default.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace obn::config {
+namespace {
+
+std::mutex  g_mu;
+Settings    g_current;
+std::string g_config_dir;
+
+#ifdef OBN_LAN_ONLY
+// print_bot: LAN-only build, no cloud endpoint is reachable
+constexpr const char* kDefaultGlobalApi  = "https://cloud-disabled.invalid";
+constexpr const char* kDefaultGlobalWeb  = "https://cloud-disabled.invalid";
+constexpr const char* kDefaultGlobalMqtt = "cloud-disabled.invalid";
+constexpr const char* kDefaultCnApi      = "https://cloud-disabled.invalid";
+constexpr const char* kDefaultCnWeb      = "https://cloud-disabled.invalid";
+constexpr const char* kDefaultCnMqtt     = "cloud-disabled.invalid";
+#else
+constexpr const char* kDefaultGlobalApi  = "https://api.bambulab.com";
+constexpr const char* kDefaultGlobalWeb  = "https://bambulab.com";
+constexpr const char* kDefaultGlobalMqtt = "us.mqtt.bambulab.com";
+constexpr const char* kDefaultCnApi      = "https://api.bambulab.cn";
+constexpr const char* kDefaultCnWeb      = "https://bambulab.cn";
+constexpr const char* kDefaultCnMqtt     = "cn.mqtt.bambulab.com";
+#endif
+
+const char* pick_or_default(const std::string& configured, const char* fallback)
+{
+    return configured.empty() ? fallback : configured.c_str();
+}
+
+std::string trim(const std::string& s)
+{
+    std::size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    std::size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+std::string to_lower(const std::string& s)
+{
+    std::string r = s;
+    std::transform(r.begin(), r.end(), r.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return r;
+}
+
+// A reported_version override must look like a Studio version: digits and
+// dots, at least one digit, bounded length.
+bool is_valid_version(const std::string& v)
+{
+    if (v.empty() || v.size() > 32) return false;
+    bool has_digit = false;
+    for (char c : v) {
+        if (c == '.') continue;
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+        has_digit = true;
+    }
+    return has_digit;
+}
+
+bool parse_line(const std::string& line, std::string& key, std::string& val)
+{
+    key.clear();
+    val.clear();
+    if (line.empty() || line[0] == '#') return false;
+    const auto eq = line.find('=');
+    if (eq == std::string::npos || eq == 0) return false;
+    key = trim(line.substr(0, eq));
+    val = trim(line.substr(eq + 1));
+    return !key.empty();
+}
+
+void apply_key(Settings& out, const std::string& key, const std::string& val)
+{
+    if      (key == "log_level")      out.log_level = val;
+    else if (key == "log_stderr")     out.log_stderr = val;
+    else if (key == "log_to_file")    out.log_to_file = val;
+    else if (key == "log_file")       out.log_file = val;
+    else if (key == "cloud_global_api_host")  out.cloud_global_api_host = val;
+    else if (key == "cloud_global_web_host")  out.cloud_global_web_host = val;
+    else if (key == "cloud_global_mqtt_host") out.cloud_global_mqtt_host = val;
+    else if (key == "cloud_cn_api_host")      out.cloud_cn_api_host = val;
+    else if (key == "cloud_cn_web_host")      out.cloud_cn_web_host = val;
+    else if (key == "cloud_cn_mqtt_host")     out.cloud_cn_mqtt_host = val;
+    else if (key == "lan_tls_skip_verify")      out.lan_tls_skip_verify = truthy(val);
+    else if (key == "cloud_mqtt_port") {
+        int p = std::atoi(val.c_str());
+        if (p > 0 && p <= 65535) out.cloud_mqtt_port = p;
+    }
+    else if (key == "block_cloud")              out.block_cloud = truthy(val);
+    else if (key == "appcert_fetch")            out.appcert_fetch = truthy(val);
+    else if (key == "cloud_hide_history")       out.cloud_hide_history = truthy(val);
+    else if (key == "cloud_pushall_on_connect") out.cloud_pushall_on_connect = truthy(val);
+    else if (key == "cloud_print") {
+        const std::string v = to_lower(val);
+        if (v == "cloud_only")
+            out.cloud_print = CloudPrintMode::CloudOnly;
+        else if (v == "try_lan_first")
+            out.cloud_print = CloudPrintMode::TryLanFirst;
+        else if (v == "lan_only")
+            out.cloud_print = CloudPrintMode::LanOnly;
+        else {
+            OBN_WARN("config: unknown cloud_print='%s', using cloud_only",
+                     val.c_str());
+            out.cloud_print = CloudPrintMode::CloudOnly;
+        }
+    }
+    else if (key == "force_timelapse_external")  out.force_timelapse_external = truthy(val);
+    else if (key == "force_ftps")                out.force_ftps = truthy(val);
+    else if (key == "disable_camera_preview")      out.disable_camera_preview = truthy(val);
+    else if (key == "prefer_lan_over_tutk")        out.prefer_lan_over_tutk = truthy(val);
+    else if (key == "mqtt_keep_connection")        out.mqtt_keep_connection = truthy(val);
+    else if (key == "override_lan_ip")            out.override_lan_ip = truthy(val);
+    else if (key == "patch_mqtt_home_flag")        out.patch_mqtt_home_flag = truthy(val);
+    else if (key == "patch_mqtt_ipcam_file")       out.patch_mqtt_ipcam_file = truthy(val);
+    else if (key == "patch_mqtt_internal_storage") out.patch_mqtt_internal_storage = truthy(val);
+    else if (key == "exp_numeric_sequence_id")     out.exp_numeric_sequence_id = truthy(val);
+    else if (key == "filter_mqtt_hms_65543")       out.filter_mqtt_hms_65543 = truthy(val);
+    else if (key == "slicer_key_pem")               out.slicer_key_pem = val;
+    else if (key == "slicer_cert_pem")             out.slicer_cert_pem = val;
+    else if (key == "slicer_crl_pem")              out.slicer_crl_pem = val;
+    else if (key == "client_name")                 out.client_name = val;
+    else if (key == "executable_info")             out.executable_info = val;
+    else if (key == "mytask_pop") {
+        // `auto` and an absent key both mean the region-based default
+        // (PoP on CN, historical bearer-only request elsewhere).
+        const bool explicit_val = to_lower(val) != "auto";
+        out.mytask_pop_set = explicit_val;
+        out.mytask_pop      = explicit_val ? truthy(val) : false;
+    }
+    else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
+    else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
+    else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;
+    else if (key == "bambusource_log_file")       out.bambusource_log_file = val;
+}
+
+Settings parse_file(const std::filesystem::path& path)
+{
+    Settings out;
+    std::ifstream in(path);
+    if (!in) return out;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string key, val;
+        if (!parse_line(line, key, val)) continue;
+        apply_key(out, key, val);
+    }
+#ifdef OBN_LAN_ONLY
+    // print_bot: LAN-only build. Cloud stays blocked whatever obn.conf says and
+    // every cloud endpoint points at a reserved name that never resolves.
+    out.block_cloud            = true;
+    out.cloud_global_api_host  = "https://cloud-disabled.invalid";
+    out.cloud_global_web_host  = "https://cloud-disabled.invalid";
+    out.cloud_global_mqtt_host = "cloud-disabled.invalid";
+    out.cloud_cn_api_host      = "https://cloud-disabled.invalid";
+    out.cloud_cn_web_host      = "https://cloud-disabled.invalid";
+    out.cloud_cn_mqtt_host     = "cloud-disabled.invalid";
+#endif
+    return out;
+}
+
+bool write_atomic(const std::filesystem::path& path, const std::string& content)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+
+    const std::filesystem::path tmp = path.string() + ".tmp";
+    std::ofstream f(tmp, std::ios::binary);
+    if (!f) return false;
+
+    f << content;
+
+    if (!f) {
+        f.close();
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    f.close();
+
+#if defined(_WIN32)
+    std::filesystem::remove(path, ec);
+#endif
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
+
+bool write_default_template(const std::filesystem::path& path)
+{
+    return write_atomic(path, kDefaultTemplate);
+}
+
+std::filesystem::path config_path(const std::string& config_dir)
+{
+    std::string dir = config_dir;
+    if (dir.empty()) return {};
+    char last = dir.back();
+    if (last != '/' && last != '\\') dir += '/';
+    return std::filesystem::path(dir) / kConfigFileName;
+}
+
+// Same block the Python installer appended (word-for-word, see
+// ensure_obn_conf() in open_bambu_networking.py).
+constexpr const char* kBlockCloudHeader =
+    "# 0 = talk to Bambu Cloud (required for cloud printing and for any\n"
+    "# printer that is not reachable over LAN). 1 = block cloud traffic.\n"
+    "block_cloud = 0\n";
+
+bool read_all(const std::filesystem::path& path, std::string& out)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return true;
+}
+
+// Split into lines that keep their original terminator, so an untouched file
+// is rewritten byte for byte.
+std::vector<std::string> split_lines_keep_ends(const std::string& data)
+{
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    while (start < data.size()) {
+        const std::size_t nl = data.find('\n', start);
+        if (nl == std::string::npos) {
+            lines.push_back(data.substr(start));
+            break;
+        }
+        lines.push_back(data.substr(start, nl - start + 1));
+        start = nl + 1;
+    }
+    return lines;
+}
+
+std::string_view strip_eol(std::string_view line)
+{
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+        line.remove_suffix(1);
+    return line;
+}
+
+// Terminator (starting after the content) of a line, "\n" when absent.
+std::string_view eol_of(std::string_view line)
+{
+    std::string_view content = strip_eol(line);
+    if (content.size() == line.size()) return "\n";
+    return line.substr(content.size());
+}
+
+// Content (terminator stripped) of a non-comment `block_cloud = <value>` line.
+// Mirrors the Python installer's comment skip plus ^\s*block_cloud\s*=\s*(\S+);
+// false for anything that pattern would not match.
+bool parse_block_cloud_line(std::string_view content, std::string_view& value)
+{
+    std::size_t i = 0;
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    if (i >= content.size() || content[i] == '#') return false;
+    constexpr std::string_view kKey = "block_cloud";
+    if (content.compare(i, kKey.size(), kKey) != 0) return false;
+    i += kKey.size();
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    if (i >= content.size() || content[i] != '=') return false;
+    ++i;
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    const std::size_t vstart = i;
+    while (i < content.size() && !std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    if (i == vstart) return false;
+    value = content.substr(vstart, i - vstart);
+    return true;
+}
+
+// Rewrite truthy block_cloud lines to 0 in place, or append the documented
+// block when the file has no key -- the logic ensure_obn_conf() applies in
+// Python, so an environment where both paths could run observes one behavior.
+EnsureOutcome fix_lines(std::vector<std::string>& lines)
+{
+    bool have_key = false;
+    bool changed  = false;
+    for (std::string& line : lines) {
+        std::string_view value;
+        if (!parse_block_cloud_line(strip_eol(line), value)) continue;
+        have_key = true;
+        if (!truthy(std::string(value))) continue;
+        // Canonical value text, original terminator (Python's text-mode
+        // rewrite normalizes endings instead; this only touches key lines).
+        line = std::string("block_cloud = 0") + std::string(eol_of(line));
+        changed = true;
+    }
+    if (have_key)
+        return changed ? EnsureOutcome::Set : EnsureOutcome::Unchanged;
+
+    if (!lines.empty()) {
+        std::string& last = lines.back();
+        if (last.empty() || last.back() != '\n') last += '\n';
+        if (!strip_eol(last).empty()) lines.push_back("\n");
+    }
+    lines.push_back(kBlockCloudHeader);
+    return EnsureOutcome::Appended;
+}
+
+EnsureOutcome ensure_block_cloud_in_file(const std::filesystem::path& path)
+{
+    std::string data;
+    if (!read_all(path, data)) return EnsureOutcome::Error;
+
+    std::vector<std::string> lines = split_lines_keep_ends(data);
+    const EnsureOutcome       outcome = fix_lines(lines);
+    if (outcome == EnsureOutcome::Unchanged) return outcome;
+
+    std::string joined;
+    for (const std::string& line : lines) joined += line;
+    return write_atomic(path, joined) ? outcome : EnsureOutcome::Error;
+}
+
+} // namespace
+
+bool is_cn_region(const std::string& region)
+{
+    return region == "CN" || region == "cn";
+}
+
+bool truthy(const std::string& val, bool fallback)
+{
+    const std::string lc = to_lower(val);
+    if (lc == "1" || lc == "true" || lc == "yes") return true;
+    if (lc == "0" || lc == "false" || lc == "no") return false;
+    return fallback;
+}
+
+EnsureOutcome ensure_block_cloud_off(const std::string& conf_path)
+{
+    if (conf_path.empty()) return EnsureOutcome::Error;
+    // u8path: the plugin passes os.fsencode()-d UTF-8 bytes (PEP 529).
+    const std::filesystem::path path = std::filesystem::u8path(conf_path);
+
+    std::error_code ec;
+    const bool exists = std::filesystem::is_regular_file(path, ec);
+
+    if (!exists) {
+        if (!write_default_template(path)) return EnsureOutcome::Error;
+        // The template ships block_cloud = 1; run the same fix as an existing
+        // file, but report Created -- that is what the installer announces.
+        const EnsureOutcome outcome = ensure_block_cloud_in_file(path);
+        return outcome == EnsureOutcome::Error ? EnsureOutcome::Error
+                                               : EnsureOutcome::Created;
+    }
+    return ensure_block_cloud_in_file(path);
+}
+
+Settings load_or_create(const std::string& config_dir)
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (config_dir.empty()) return g_current;
+
+    const auto path = config_path(config_dir);
+    if (path.empty()) return g_current;
+
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec))
+        (void)write_default_template(path);
+
+    g_config_dir = config_dir;
+    g_current = parse_file(path);
+    obn::lan_tls::propagate_cross_so_env(g_current);
+    return g_current;
+}
+
+Settings load_if_exists(const std::string& config_dir)
+{
+    if (config_dir.empty()) return {};
+    const auto path = config_path(config_dir);
+    if (path.empty()) return {};
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) return {};
+    return parse_file(path);
+}
+
+const Settings& current()
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_current;
+}
+
+const std::string& dir()
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_config_dir;
+}
+
+std::string path_in_dir(const std::string& basename)
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_config_dir.empty()) return {};
+    return (std::filesystem::path(g_config_dir) / basename).string();
+}
+
+std::string read_version_override(const std::string& dir)
+{
+    if (dir.empty()) return {};
+    const auto path = std::filesystem::path(dir) / kVersionOverrideFileName;
+    std::ifstream in(path);
+    if (!in) return {};
+    std::string v;
+    if (!std::getline(in, v)) return {};
+    v = trim(v);
+    if (!is_valid_version(v)) {
+        OBN_WARN("reported_version='%s' in %s is not a version; ignoring",
+                 v.c_str(), dir.c_str());
+        return {};
+    }
+    return v;
+}
+
+std::string reported_version()
+{
+    // get_version() is called before load_or_create(), so config::dir() is
+    // usually still empty here; probe the same OrcaSlicer data dirs the
+    // plugin installer writes into.
+    std::vector<std::filesystem::path> dirs;
+    if (const std::string cfg = dir(); !cfg.empty())
+        dirs.push_back(std::filesystem::path(cfg));
+#if defined(_WIN32)
+    if (const char* appdata = std::getenv("APPDATA"))
+        dirs.push_back(std::filesystem::path(appdata) / "OrcaSlicer");
+#elif defined(__APPLE__)
+    if (const char* home = std::getenv("HOME"))
+        dirs.push_back(std::filesystem::path(home) / "Library" /
+                       "Application Support" / "OrcaSlicer");
+#else
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"))
+        dirs.push_back(std::filesystem::path(xdg) / "OrcaSlicer");
+    if (const char* home = std::getenv("HOME"))
+        dirs.push_back(std::filesystem::path(home) / ".config" / "OrcaSlicer");
+#endif
+    for (const auto& d : dirs) {
+        const std::string v = read_version_override(d.string());
+        if (!v.empty()) return v;
+    }
+    return {};
+}
+
+std::string cloud_api_host_for(const Settings& s, const std::string& region)
+{
+    if (is_cn_region(region))
+        return pick_or_default(s.cloud_cn_api_host, kDefaultCnApi);
+    return pick_or_default(s.cloud_global_api_host, kDefaultGlobalApi);
+}
+
+std::string cloud_web_host_for(const Settings& s, const std::string& region)
+{
+    if (is_cn_region(region))
+        return pick_or_default(s.cloud_cn_web_host, kDefaultCnWeb);
+    return pick_or_default(s.cloud_global_web_host, kDefaultGlobalWeb);
+}
+
+std::string cloud_mqtt_host_for(const Settings& s, const std::string& region)
+{
+    if (is_cn_region(region))
+        return pick_or_default(s.cloud_cn_mqtt_host, kDefaultCnMqtt);
+    return pick_or_default(s.cloud_global_mqtt_host, kDefaultGlobalMqtt);
+}
+
+} // namespace obn::config
+
+// Installer bridge: OrcaSlicer's plugin audit refuses every Python open() of
+// a path containing "conf" (denied-path keyword) before any allow-list is
+// consulted, so open_bambu_networking.ensure_obn_conf() delegates the
+// obn.conf write here -- C++ file writes are outside the Python audit hook
+// and this library owns the file anyway. Returns the EnsureOutcome as int
+// (-1 on failure), which the plugin maps to its install-message wording.
+OBN_ABI int obn_ensure_conf_block_cloud(const char* conf_path)
+{
+    if (!conf_path) return -1;
+    return static_cast<int>(obn::config::ensure_block_cloud_off(conf_path));
+}

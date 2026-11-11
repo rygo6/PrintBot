@@ -1,0 +1,383 @@
+#!/bin/sh
+# Autotools-style wrapper around CMake. Drops a ready-to-build tree in
+# ./build/ (or wherever --build-dir points) and writes a tiny config.mk
+# so the top-level Makefile knows the build directory. Every knob below
+# maps 1:1 to a CMake cache variable; run cmake directly if you want
+# something this script does not expose.
+set -eu
+
+BUILD_DIR=build
+BUILD_TYPE=Release
+PREFIX=""
+OBN_VERSION=""
+CLIENT_TYPE=bambu_studio
+TESTS=OFF
+PATCH_CONF=ON
+EXTRA_CMAKE_ARGS=""
+
+usage() {
+    cat <<'EOF'
+Usage: ./configure [OPTIONS]
+
+Prepares an out-of-tree CMake build so 'make' and 'make install' work.
+Running it again is safe -- it refreshes the build tree with the new flags.
+
+Client selection:
+  --client-type=TYPE     Slicer the plugin will be installed for. One of:
+                           bambu_studio  (default)
+                           orca_slicer
+                         The value drives default --prefix, version
+                         auto-detection, the .so file name and which
+                         conf file 'make install' patches.
+
+Install paths:
+  --prefix=DIR           Install prefix; where 'make install' copies the
+                         libraries. Per --client-type, configure prefers
+                         the native config dir and only falls back to
+                         the Flatpak config dir when the native one is
+                         missing AND the Flatpak one exists (Linux only):
+                           bambu_studio -> $HOME/.config/BambuStudio
+                                           or Flatpak path (see above)
+                                           or on macOS:
+                                           $HOME/Library/Application
+                                             Support/BambuStudio
+                           orca_slicer  -> $HOME/.config/OrcaSlicer
+                                           or Flatpak path
+                                           or on macOS:
+                                           $HOME/Library/Application
+                                             Support/OrcaSlicer
+                         On Windows you must pass --prefix explicitly.
+
+Build settings:
+  --build-dir=DIR        Build directory (default: build).
+  --build-type=TYPE      Release | Debug | RelWithDebInfo | MinSizeRel
+                         (default: Release).
+  --with-version=VER     Override the version string reported via
+                         bambu_network_get_version(). When not set,
+                         configure auto-detects from the client conf in
+                         the install prefix:
+                           bambu_studio -> reads "app.version" from
+                             BambuStudio.conf and bumps the last
+                             component to 99.
+                           orca_slicer -> reads
+                             "app.network_plugin_version" from
+                             OrcaSlicer.conf, falls back to 02.03.00 if
+                             missing, and bumps the last component to 99.
+                         Launch the slicer once so it writes its config,
+                         or pass --with-version=... by hand.
+
+Optional features:
+  --enable-tests             Build probe_plugin / *_live_test smoke tests
+                             (disabled by default). Disable again with
+                             --disable-tests.
+  --no-conf-patch            'make install' will not edit the slicer's
+                             conf file (BambuStudio.conf or
+                             OrcaSlicer.conf). Use this for staging or
+                             if you manage the conf yourself.
+
+Other:
+  --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
+                         multiple flags (e.g. --cmake-arg=-GNinja).
+  -h, --help             Show this help and exit.
+
+Examples:
+  ./configure
+  ./configure --prefix=/opt/my-bambu --build-type=Debug
+  ./configure --no-conf-patch
+  ./configure --client-type=orca_slicer
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*)                PREFIX="${arg#*=}" ;;
+        --build-dir=*)             BUILD_DIR="${arg#*=}" ;;
+        --build-type=*)            BUILD_TYPE="${arg#*=}" ;;
+        --with-version=*)          OBN_VERSION="${arg#*=}" ;;
+        --client-type=*)           CLIENT_TYPE="${arg#*=}" ;;
+        --disable-tests)           TESTS=OFF ;;
+        --enable-tests)            TESTS=ON ;;
+        --no-conf-patch)           PATCH_CONF=OFF ;;
+        --with-conf-patch)         PATCH_CONF=ON ;;
+        --video-backend=*)
+            printf 'configure: --video-backend is deprecated and ignored '\
+'(libBambuSource now passes raw H.264 straight to gstbambusrc, '\
+'no transcoder backend is built into the plugin).\n' >&2 ;;
+        --cmake-arg=*)             EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS ${arg#*=}" ;;
+        -h|--help)                 usage; exit 0 ;;
+        *)
+            printf 'configure: unknown option: %s\n\n' "$arg" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if ! command -v git >/dev/null 2>&1; then
+    echo "configure: git is required (vendored libmosquitto FetchContent)" >&2
+    exit 1
+fi
+
+case "$CLIENT_TYPE" in
+    bambu_studio|orca_slicer) ;;
+    *)
+        printf 'configure: --client-type must be bambu_studio or orca_slicer (got "%s")\n' \
+            "$CLIENT_TYPE" >&2
+        exit 2
+        ;;
+esac
+
+if ! command -v cmake >/dev/null 2>&1; then
+    echo "configure: cmake is required but was not found in \$PATH" >&2
+    exit 1
+fi
+
+has_utlist_header() {
+    for hdr in \
+        /usr/include/utlist.h \
+        /usr/local/include/utlist.h \
+        /usr/include/uthash/utlist.h \
+        /usr/local/include/uthash/utlist.h \
+        /opt/homebrew/include/utlist.h \
+        /opt/homebrew/include/uthash/utlist.h
+    do
+        [ -r "$hdr" ] && return 0
+    done
+
+    return 1
+}
+
+if ! has_utlist_header; then
+    cat >&2 <<'EOF'
+configure: utlist.h (uthash development headers) is required for the vendored libmosquitto build, but it was not found.
+
+Install the package and run configure again:
+  Debian/Ubuntu: sudo apt install uthash-dev
+  Fedora/RHEL:   sudo dnf install uthash-devel
+  macOS Homebrew: brew install uthash
+EOF
+    exit 1
+fi
+
+# macOS static OpenSSL/curl embed (OBN_MACOS_STATIC_DEPS, default ON) needs
+# OPENSSL_ROOT_DIR pointing at brew openssl@3 so FindOpenSSL resolves the
+# static .a archives. CI already exports this; for local ./configure we
+# auto-detect when unset.
+case "$EXTRA_CMAKE_ARGS" in
+    *-DOPENSSL_ROOT_DIR=*|*-DOPENSSL_ROOT_DIR:*) _obn_openssl_root_in_args=1 ;;
+    *) _obn_openssl_root_in_args=0 ;;
+esac
+if [ "$(uname -s)" = "Darwin" ] \
+   && [ -z "${OPENSSL_ROOT_DIR:-}" ] \
+   && [ "$_obn_openssl_root_in_args" -eq 0 ] \
+   && command -v brew >/dev/null 2>&1
+then
+    _obn_brew_openssl="$(brew --prefix openssl@3 2>/dev/null || true)"
+    if [ -n "$_obn_brew_openssl" ] && [ -d "$_obn_brew_openssl" ]; then
+        EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DOPENSSL_ROOT_DIR=${_obn_brew_openssl}"
+        echo "configure: macOS OPENSSL_ROOT_DIR=${_obn_brew_openssl} (brew openssl@3)"
+    else
+        echo "configure: warning: brew openssl@3 not found; macOS static OpenSSL link may fail." >&2
+        echo "configure:          install with: brew install openssl@3" >&2
+    fi
+    unset _obn_brew_openssl
+fi
+unset _obn_openssl_root_in_args
+
+# On Linux and macOS, default the install prefix to the per-client config
+# directory when PREFIX is unset. Linux also prefers native ~/.config over
+# Flatpak under ~/.var/app when only one exists.
+# Both supported slicers (Bambu Studio and Orca Slicer) ship as Flathub
+# apps too -- under the Flatpak runtime the slicer's data dir lives at
+# ~/.var/app/<app-id>/config/<dir>/ instead of ~/.config/<dir>/. We
+# prefer the native config dir; only fall back to the Flatpak path if
+# native is missing AND Flatpak exists. A user with both installed
+# almost always wants the native one (the Flatpak install rarely needs
+# to be touched) -- if they want the Flatpak one anyway, they can pass
+# --prefix= explicitly.
+# Always pass -DCMAKE_INSTALL_PREFIX below when PREFIX is set. If we omit
+# it, CMake keeps the previous CMAKE_INSTALL_PREFIX in CMakeCache.txt --
+# so after ./configure --prefix=.../flatpak/... a plain ./configure
+# would still install to the old path while version detection reads the
+# wrong conf file.
+STUDIO_NATIVE_DIR="${HOME:-}/.config/BambuStudio"
+STUDIO_FLATPAK_DIR="${HOME:-}/.var/app/com.bambulab.BambuStudio/config/BambuStudio"
+STUDIO_MAC_DIR="${HOME:-}/Library/Application Support/BambuStudio"
+ORCA_NATIVE_DIR="${HOME:-}/.config/OrcaSlicer"
+ORCA_FLATPAK_DIR="${HOME:-}/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer"
+ORCA_MAC_DIR="${HOME:-}/Library/Application Support/OrcaSlicer"
+
+case "$CLIENT_TYPE" in
+    bambu_studio)
+        client_label="Bambu Studio"
+        client_native_dir="$STUDIO_NATIVE_DIR"
+        client_flatpak_dir="$STUDIO_FLATPAK_DIR"
+        client_mac_dir="$STUDIO_MAC_DIR"
+        ;;
+    orca_slicer)
+        client_label="Orca Slicer"
+        client_native_dir="$ORCA_NATIVE_DIR"
+        client_flatpak_dir="$ORCA_FLATPAK_DIR"
+        client_mac_dir="$ORCA_MAC_DIR"
+        ;;
+esac
+
+if [ -z "$PREFIX" ]; then
+    case "$(uname -s)" in
+        Linux)
+            if [ -d "$client_native_dir" ]; then
+                PREFIX="$client_native_dir"
+            elif [ -d "$client_flatpak_dir" ]; then
+                PREFIX="$client_flatpak_dir"
+                echo "configure: detected Flatpak $client_label install at $client_flatpak_dir"
+            else
+                PREFIX="$client_native_dir"
+            fi
+            ;;
+        Darwin)
+            # wx StandardPaths user data dir on macOS (see research/INDEX.md).
+            PREFIX="$client_mac_dir"
+            ;;
+    esac
+fi
+
+# Auto-detect the plugin version from the slicer's conf file when the user
+# did not pass --with-version. The plugin must report a version whose first
+# 8 characters match what the slicer expects (see README), so the simplest
+# reliable source is the config file of the slicer we are installing next
+# to. boost::json pretty-prints one '"key" : "X.Y.Z.W"' line at the top
+# level of the "app" object. We bump the last component to 99 so the plugin
+# always looks "newer" than the agent the slicer shipped with itself.
+#
+# Studio: read "app.version" -- the slicer tag itself; the bundled plugin
+#   matches it exactly, so anything .99 wins the compatibility gate.
+# Orca:   read "app.network_plugin_version" -- Orca tracks the plugin
+#   version separately from the slicer version. If absent (e.g. user has
+#   never installed a plugin in Orca), fall back to 02.03.00 which is the
+#   latest entry in AVAILABLE_NETWORK_VERSIONS as of writing -- see
+#   3rd_party/OrcaSlicer/src/slic3r/Utils/bambu_networking.hpp.
+#
+# If auto-detection fails we refuse to guess for Studio: shipping a plugin
+# with a stale hard-coded version silently breaks the slicer's compat gate
+# on the user's machine, and that failure mode is much nastier than a
+# configure-time error.
+if [ -z "$OBN_VERSION" ]; then
+    case "$CLIENT_TYPE" in
+        bambu_studio)
+            conf="$PREFIX/BambuStudio.conf"
+            json_key="version"
+            ;;
+        orca_slicer)
+            conf="$PREFIX/OrcaSlicer.conf"
+            json_key="network_plugin_version"
+            ;;
+    esac
+
+    detected=""
+    if [ -r "$conf" ]; then
+        detected=$(sed -n \
+            "s/^[[:space:]]*\"${json_key}\"[[:space:]]*:[[:space:]]*\"\([0-9][0-9.]*\)\".*/\1/p" \
+            "$conf" | head -n1)
+    fi
+
+    if [ -z "$detected" ] && [ "$CLIENT_TYPE" = "orca_slicer" ]; then
+        # Orca writes network_plugin_version only after it has installed a
+        # plugin at least once. A clean Orca install has no key at all, so
+        # fall back to the latest version Orca knows about. See
+        # AVAILABLE_NETWORK_VERSIONS in
+        # 3rd_party/OrcaSlicer/src/slic3r/Utils/bambu_networking.hpp.
+        detected="02.03.00"
+        echo "configure: no $json_key in $conf -- defaulting to $detected"
+    fi
+
+    if [ -z "$detected" ]; then
+        cat >&2 <<EOF
+configure: cannot determine the plugin version automatically.
+
+  Tried to read "$json_key" from: $conf
+  $( [ -r "$conf" ] || echo "(file does not exist or is not readable)" )
+
+  Launch the slicer at least once so it writes its config, or pass the
+  version explicitly, for example:
+
+      ./configure --with-version=02.05.02.99
+
+  The slicer compares only the first 8 characters ("MAJOR.MINOR.PATCH"),
+  so use X.Y.Z from the slicer you are installing next to and put .99 last.
+EOF
+        exit 1
+    fi
+
+    # CMake's OBN_VERSION regex requires exactly four dotted components.
+    # 4-component input: replace the last with .99. 3-component input
+    # (typical for the Orca fallback "02.03.00"): append .99 instead of
+    # eating a component. Anything else is rejected up front so the user
+    # gets a friendly error rather than a CMake configure-time stack.
+    case "$detected" in
+        *.*.*.*)
+            OBN_VERSION=$(echo "$detected" | sed -E 's/\.[0-9]+$/.99/')
+            ;;
+        *.*.*)
+            OBN_VERSION="${detected}.99"
+            ;;
+        *)
+            printf 'configure: cannot bump version "%s": expected 3 or 4 dotted components.\n' \
+                "$detected" >&2
+            exit 1
+            ;;
+    esac
+    echo "configure: detected $client_label plugin baseline $detected in $conf"
+    echo "configure: plugin version set to $OBN_VERSION (override with --with-version=...)"
+fi
+
+set -- -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+[ -n "$PREFIX" ]      && set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"
+[ -n "$OBN_VERSION" ] && set -- "$@" -DOBN_VERSION="$OBN_VERSION"
+set -- "$@" \
+    -DOBN_CLIENT_TYPE="$CLIENT_TYPE" \
+    -DOBN_BUILD_TESTS="$TESTS" \
+    -DOBN_PATCH_CLIENT_CONF="$PATCH_CONF"
+# shellcheck disable=SC2086
+[ -n "$EXTRA_CMAKE_ARGS" ] && set -- "$@" $EXTRA_CMAKE_ARGS
+
+echo "configure: cmake $*"
+cmake "$@"
+
+# The top-level Makefile reads this to find the build tree. Everything
+# else lives in CMakeCache.txt and survives 'make clean'.
+{
+    echo "# Generated by ./configure. Re-run it to refresh."
+    printf 'BUILD_DIR := %s\n' "$BUILD_DIR"
+} > config.mk
+
+case "$CLIENT_TYPE" in
+    bambu_studio)
+        case "$(uname -s)" in
+            Darwin) patch_target_conf="$STUDIO_MAC_DIR/BambuStudio.conf" ;;
+            *)        patch_target_conf="$STUDIO_NATIVE_DIR/BambuStudio.conf" ;;
+        esac
+        ;;
+    orca_slicer)
+        patch_target_conf="${PREFIX}/OrcaSlicer.conf"
+        ;;
+esac
+
+cat <<EOF
+
+configure: done.
+
+Selected client: $CLIENT_TYPE
+Install prefix : $PREFIX
+Plugin version : $OBN_VERSION
+
+Next steps:
+  make             # build   (delegates to: cmake --build $BUILD_DIR)
+  make install     # install (delegates to: cmake --install $BUILD_DIR)
+                   # also patches:
+                   #   $patch_target_conf
+                   # when OBN_PATCH_CLIENT_CONF is enabled and the patch
+                   # script runs (see CMakeLists.txt)
+  make test        # run the smoke tests
+
+Re-run './configure --help' for the full list of options.
+EOF

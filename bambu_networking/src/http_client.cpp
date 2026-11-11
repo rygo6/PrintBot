@@ -1,0 +1,375 @@
+#include "obn/http_client.hpp"
+
+#include "obn/log.hpp"
+
+#include <curl/curl.h>
+
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <sstream>
+
+namespace obn::http {
+
+namespace {
+
+std::atomic<bool> g_inited{false};
+std::mutex        g_init_mu;
+
+// Identify HTTP traffic as this project. Callers (or Studio via
+// bambu_network_set_extra_http_header) may override with Request.headers.
+std::string default_user_agent()
+{
+#ifndef OBN_VERSION_STRING
+#    error "OBN_VERSION_STRING is not defined; build through the top-level ./configure or pass -DOBN_VERSION=... to cmake"
+#endif
+    return std::string("OBN/") + OBN_VERSION_STRING;
+}
+
+size_t on_body(void* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    auto* out = static_cast<std::string*>(userdata);
+    out->append(static_cast<char*>(ptr), size * nmemb);
+    return size * nmemb;
+}
+
+int on_curl_debug(CURL* /*handle*/, curl_infotype type, char* data, size_t size,
+                  void* /*userp*/)
+{
+    // Keep verbose output to our log so we can diagnose "helpful"
+    // things libcurl does behind our back (e.g. auto Expect:
+    // 100-continue, forced Transfer-Encoding: chunked).
+    if (type != CURLINFO_HEADER_OUT && type != CURLINFO_HEADER_IN)
+        return 0;
+    std::string s = redact_secret_headers(std::string(data, size));
+    // Strip trailing CRLF run to keep the log one-line-per-header.
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    if (s.empty()) return 0;
+    const char* dir = type == CURLINFO_HEADER_OUT ? ">>" : "<<";
+    OBN_DEBUG("curl %s %s", dir, s.c_str());
+    return 0;
+}
+
+size_t on_header(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+    auto* resp = static_cast<Response*>(userdata);
+    size_t n = size * nitems;
+    std::string line(buffer, n);
+    // Strip CRLF.
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+        line.pop_back();
+    // case-insensitive prefix check
+    auto ieq = [](const std::string& s, const char* p) {
+        auto len = std::strlen(p);
+        if (s.size() < len) return false;
+        for (size_t i = 0; i < len; ++i)
+            if (std::tolower(static_cast<unsigned char>(s[i])) !=
+                std::tolower(static_cast<unsigned char>(p[i])))
+                return false;
+        return true;
+    };
+    if (ieq(line, "content-type:")) {
+        auto pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string v = line.substr(pos + 1);
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            resp->content_type = v;
+        }
+    } else if (ieq(line, "set-cookie:")) {
+        auto pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string v = line.substr(pos + 1);
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            resp->set_cookies.push_back(v);
+        }
+    }
+    return n;
+}
+
+const char* method_verb(Method m)
+{
+    switch (m) {
+        case Method::GET:   return "GET";
+        case Method::POST:  return "POST";
+        case Method::PUT:   return "PUT";
+        case Method::DEL:   return "DELETE";
+        case Method::PATCH: return "PATCH";
+    }
+    return "GET";
+}
+
+int on_xferinfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
+                curl_off_t ultotal, curl_off_t ulnow)
+{
+    auto* req = static_cast<const Request*>(clientp);
+    if (req && req->progress_cb) {
+        bool ok = req->progress_cb(
+            static_cast<std::uint64_t>(dltotal > 0 ? dltotal : 0),
+            static_cast<std::uint64_t>(dlnow > 0 ? dlnow : 0),
+            static_cast<std::uint64_t>(ultotal > 0 ? ultotal : 0),
+            static_cast<std::uint64_t>(ulnow > 0 ? ulnow : 0));
+        if (!ok) return 1;
+    }
+    return 0;
+}
+
+int on_sockopt(void* /*clientp*/, curl_socket_t curlfd, curlsocktype /*purpose*/)
+{
+    // Enlarge socket send buffer to 2 MiB so TCP window scaling can fill the pipe
+    // on high-latency WAN links (e.g. 330ms RTT between South America and Oregon).
+    int sndbuf = 2097152;
+    setsockopt(curlfd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+    return CURL_SOCKOPT_OK;
+}
+
+struct UploadCtx {
+    const char* ptr;
+    size_t left;
+};
+
+size_t on_upload_read(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+    auto* ctx = static_cast<UploadCtx*>(userdata);
+    size_t max_bytes = size * nitems;
+    size_t to_copy = (std::min)(max_bytes, ctx->left);
+    if (to_copy > 0) {
+        std::memcpy(buffer, ctx->ptr, to_copy);
+        ctx->ptr += to_copy;
+        ctx->left -= to_copy;
+    }
+    return to_copy;
+}
+
+} // namespace
+
+void global_init()
+{
+    if (g_inited.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lk(g_init_mu);
+    if (g_inited.load(std::memory_order_relaxed)) return;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    g_inited.store(true, std::memory_order_release);
+}
+
+Response perform(const Request& req)
+{
+    global_init();
+
+    Response resp;
+    CURL*    curl = curl_easy_init();
+    if (!curl) {
+        resp.error = "curl_easy_init failed";
+        return resp;
+    }
+
+    curl_slist* hdrs = nullptr;
+    bool        have_ua = false;
+    bool        have_accept = false;
+    bool        have_ct = false;
+    for (const auto& [k, v] : req.headers) {
+        // libcurl idiom: "Header:" (no value, no space) removes an
+        // internally-added header such as Content-Type or Expect.
+        // "Header: value" sends the header normally.
+        std::string kv = v.empty() ? (k + ":") : (k + ": " + v);
+        hdrs = curl_slist_append(hdrs, kv.c_str());
+        std::string lk = k;
+        for (auto& c : lk) c = std::tolower(static_cast<unsigned char>(c));
+        if (lk == "user-agent")   have_ua = true;
+        if (lk == "accept")       have_accept = true;
+        if (lk == "content-type") have_ct = true;
+    }
+    if (!have_ua) {
+        std::string kv = "User-Agent: " + default_user_agent();
+        hdrs = curl_slist_append(hdrs, kv.c_str());
+    }
+    if (!have_accept && !req.no_default_accept) {
+        hdrs = curl_slist_append(hdrs, "Accept: application/json");
+    }
+    const bool method_has_body =
+        req.method == Method::POST || req.method == Method::PUT ||
+        req.method == Method::PATCH ||
+        (req.method == Method::DEL && !req.body.empty());
+    if (method_has_body && !have_ct && !req.no_default_content_type) {
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL,              req.url.c_str());
+    curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION,  on_sockopt);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,   static_cast<long>(req.connect_timeout_s));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,          static_cast<long>(req.timeout_s));
+    if (req.low_speed_limit > 0 && req.low_speed_time_s > 0) {
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, static_cast<long>(req.low_speed_limit));
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  static_cast<long>(req.low_speed_time_s));
+    }
+    if (req.progress_cb) {
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_xferinfo);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     &req);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
+    }
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE,        524288L);   // 512 KiB buffer
+    curl_easy_setopt(curl, CURLOPT_UPLOAD_BUFFERSIZE, 1048576L);  // 1 MiB upload chunk
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY,       1L);        // disable Nagle
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,       hdrs);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS,        10L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING,  "");       // auto gzip/br if libcurl was built with it
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,    on_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,        &resp.body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION,   on_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA,       &resp);
+
+    UploadCtx up_ctx{req.body.data(), req.body.size()};
+    if (req.is_upload) {
+        curl_easy_setopt(curl, CURLOPT_UPLOAD,          1L);
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(req.body.size()));
+        curl_easy_setopt(curl, CURLOPT_READFUNCTION,     on_upload_read);
+        curl_easy_setopt(curl, CURLOPT_READDATA,         &up_ctx);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,    method_verb(req.method));
+        if (method_has_body) {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(req.body.size()));
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS,          req.body.data());
+        }
+    }
+
+    // Wire-level tracing of every HTTP request is very useful when
+    // debugging signatures (S3, Bambu cloud) but fills the log fast
+    // during normal use. Gated behind OBN_HTTP_TRACE=1 so we can turn
+    // it on for a single session without a rebuild.
+    static const bool s_trace_http = []() {
+        const char* v = std::getenv("OBN_HTTP_TRACE");
+        return v && *v && *v != '0';
+    }();
+    if (s_trace_http) {
+        curl_easy_setopt(curl, CURLOPT_VERBOSE,       1L);
+        curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, on_curl_debug);
+    }
+
+    if (req.insecure) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    } else if (!req.ca_file.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, req.ca_file.c_str());
+    }
+
+    OBN_DEBUG("http %s %s (body=%zu)",
+              method_verb(req.method), req.url.c_str(), req.body.size());
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        resp.error = curl_easy_strerror(rc);
+    } else {
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        resp.status_code = status;
+    }
+
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    OBN_DEBUG("http %s %s -> %ld (%zu bytes)%s%s",
+              method_verb(req.method), req.url.c_str(),
+              resp.status_code, resp.body.size(),
+              resp.error.empty() ? "" : " err=",
+              resp.error.c_str());
+    return resp;
+}
+
+Response get_json(const std::string& url,
+                  const std::map<std::string, std::string>& headers,
+                  const std::string& ca_file)
+{
+    Request r;
+    r.method  = Method::GET;
+    r.url     = url;
+    r.headers = headers;
+    r.ca_file = ca_file;
+    return perform(r);
+}
+
+Response post_json(const std::string& url,
+                   const std::string& body,
+                   const std::map<std::string, std::string>& headers,
+                   const std::string& ca_file)
+{
+    Request r;
+    r.method  = Method::POST;
+    r.url     = url;
+    r.body    = body;
+    r.headers = headers;
+    r.ca_file = ca_file;
+    return perform(r);
+}
+
+std::string url_encode(const std::string& in)
+{
+    static const char HEX[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size() * 3);
+    for (unsigned char c : in) {
+        bool unreserved = (c >= 'A' && c <= 'Z') ||
+                          (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') ||
+                          c == '-' || c == '_' || c == '.' || c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(HEX[(c >> 4) & 0xF]);
+            out.push_back(HEX[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+std::string redact_secret_headers(const std::string& block)
+{
+    static const char* const kSecretHeaders[] = {
+        "authorization",        "proxy-authorization",
+        "cookie",               "set-cookie",
+        "x-amz-security-token", "x-oss-security-token",
+        "x-bbl-device-security-sign",
+    };
+    auto redact_line = [](const std::string& line) -> std::string {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) return line;
+        std::string name = line.substr(0, colon);
+        for (auto& ch : name)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        bool secret = false;
+        for (const char* k : kSecretHeaders) secret = secret || name == k;
+        if (!secret) return line;
+
+        std::size_t v = line.find_first_not_of(' ', colon + 1);
+        if (v == std::string::npos) return line;
+        std::string kept = line.substr(0, v);
+        if (name == "authorization" || name == "proxy-authorization") {
+            const auto sp = line.find(' ', v);
+            if (sp != std::string::npos) {
+                kept = line.substr(0, sp + 1);
+                v    = sp + 1;
+            }
+        }
+        std::size_t end = line.size();
+        if (end > v && line[end - 1] == '\r') --end;
+        return kept + "<redacted " + std::to_string(end - v) + " bytes>" +
+               line.substr(end);
+    };
+
+    std::string out;
+    out.reserve(block.size());
+    std::size_t pos = 0;
+    while (pos < block.size()) {
+        const auto nl = block.find('\n', pos);
+        const auto len = (nl == std::string::npos ? block.size() : nl) - pos;
+        out += redact_line(block.substr(pos, len));
+        if (nl == std::string::npos) break;
+        out += '\n';
+        pos = nl + 1;
+    }
+    return out;
+}
+
+} // namespace obn::http
