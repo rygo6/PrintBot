@@ -1,0 +1,50 @@
+Open Bamboo Networking — @PLATFORM@ distribution
+================================================
+
+Build:   @VERSION_LABEL@
+Date:    @DATE@
+GitHub:  https://github.com/ClusterM/open-bamboo-networking
+
+This archive contains pre-built plugin binaries for multiple ABI
+versions of Bambu Studio and Orca Slicer.
+
+Quick install
+-------------
+
+@INSTALL_INSTRUCTIONS@
+
+What's inside
+-------------
+
+  lib/          Pre-built binaries for each supported ABI version.
+                The installer picks the right one automatically.
+
+  @INSTALL_SCRIPT@       Interactive installer script.
+
+Before installation
+-------------------
+
+  Close Bambu Studio / Orca Slicer if it is running. The installer
+  will remind you before copying files.
+
+After installation
+------------------
+
+  1. Launch the slicer — it should load the open-bamboo-networking plugin.
+  2. Plugin settings are in obn.conf inside the slicer's config
+     directory (created automatically on first launch). Edit it to
+     customize logging, cloud access, etc.
+
+Support the developer and the project
+-------------------------------------
+
+This project has been built entirely through the author's enthusiasm, with
+a tremendous personal investment of time, effort, and financial resources.
+If this work helps you, please consider supporting its further development.
+
+  GitHub Sponsors:   https://github.com/sponsors/ClusterM
+  Patreon:           https://www.patreon.com/c/ClusterMeerkat
+  Buy Me A Coffee:   https://www.buymeacoffee.com/cluster
+  Sber:              https://messenger.online.sberbank.ru/sl/Lnb2OLE4JsyiEhQgC
+  Donation Alerts:   https://www.donationalerts.com/r/clustermeerkat
+  Boosty:            https://boosty.to/cluster

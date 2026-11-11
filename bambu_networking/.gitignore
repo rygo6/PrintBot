@@ -1,0 +1,45 @@
+build/
+build-*/
+build.stale-*/
+config.mk
+config.ps1
+.cache/
+.vcpkg/
+.cursor/
+# vcpkg manifest-mode install tree: regenerated from vcpkg.json on every
+# fresh configure, can easily reach gigabytes (downloaded sources, debug
+# libs, etc.). Nothing in the repo should reference it directly.
+vcpkg_installed/
+compile_commands.json
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+*.pyc
+.vscode/
+.idea/
+patches/
+3rd_party/
+
+# Diagnostic captures we keep producing while debugging Studio:
+# session logs from BambuStudio.conf log dir, exported symbol tables
+# from the stock plugin, ad-hoc cmake/build transcripts, etc. They
+# are useful locally but nothing in the repo references them.
+*.log
+*.log.0
+*.log.0.log
+obn-session.log*
+obn_session_log_*.txt
+exports_*.txt
+cmake_bambu_out.txt
+debug_*.log.*
+
+# Private keys and certificates.
+*.pem
+*.key
+*cert_id.txt
+# ...except the vendored public root CA bundle we compile in (see
+# include/obn/cloud_ca_bundle.hpp) - it's curl.se's public cacert.pem,
+# not a secret.
+!resources/cacert.pem

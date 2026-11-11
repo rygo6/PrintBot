@@ -1,0 +1,654 @@
+// Tests for src/signing.cpp — classifier, envelope structure, and signature
+// verification using a freshly generated RSA test keypair.
+//
+// D-07 header note (requirement-letter-vs-reality deviation, recorded per the
+// Phase 2 precedent): this file follows the repo convention (int main() +
+// fail_count + CHECK), NOT Catch2 — REQUIREMENTS calls the new case a
+// "Catch2 test", but only ssdp_listener_test.cpp is actually Catch2 in this
+// tree; Catch2 conversion of this file is deferred (test-infrastructure work).
+
+#include "obn/signing.hpp"
+#include "obn/config.hpp"
+#include "obn/json_lite.hpp"
+
+#include <openssl/asn1.h>
+#include <openssl/bn.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+
+#include <cassert>
+#include <cstdio>
+#include <cstdint>
+#include <fcntl.h>
+#include <iostream>
+#include <memory>
+#include <string>
+#ifdef _WIN32
+// MSVC port (Pitfall 3): no <unistd.h> — POSIX names are mapped to their
+// underscore-prefixed CRT equivalents below; POSIX branch stays untouched.
+#include <cstdlib>
+#include <io.h>
+#define close _close
+#define open _open
+#define unlink _unlink
+#else
+#include <unistd.h>
+#endif
+#include <vector>
+
+#define CHECK(cond) do {                                                    \
+    if (!(cond)) {                                                          \
+        std::cerr << "FAIL " << __FILE__ << ":" << __LINE__                \
+                  << ": " #cond "\n";                                       \
+        return 1;                                                           \
+    }                                                                       \
+} while (0)
+
+// ---------------------------------------------------------------------------
+// Global test keypair — set in main() before any test runs.
+// ---------------------------------------------------------------------------
+
+static EVP_PKEY* g_test_key = nullptr;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static std::string envelope_field(const std::string& json, const std::string& key)
+{
+    auto val = obn::json::parse(json);
+    if (!val) return {};
+    return val->find("header." + key).as_string();
+}
+
+// g_test_key is a full keypair; EVP_DigestVerifyInit accepts it for
+// verification using its public component.
+static EVP_PKEY* make_pub_key() { return g_test_key; }
+
+// Verify an RSA-PKCS#1-v1.5-SHA256 base64 signature against `msg`.
+static bool verify_b64_sig(const std::string& msg, const std::string& sig_b64)
+{
+    // Decode base64.
+    auto b64_decode = [](const std::string& b64) -> std::vector<unsigned char> {
+        std::vector<unsigned char> out;
+        out.reserve(b64.size() * 3 / 4);
+        auto val = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '+') return 62;
+            if (c == '/') return 63;
+            return -1; // '=' or unknown
+        };
+        for (std::size_t i = 0; i + 4 <= b64.size(); i += 4) {
+            int v0 = val(b64[i]), v1 = val(b64[i+1]);
+            int v2 = val(b64[i+2]), v3 = val(b64[i+3]);
+            if (v0 < 0 || v1 < 0) break;
+            out.push_back(static_cast<unsigned char>((v0 << 2) | (v1 >> 4)));
+            if (v2 >= 0) out.push_back(static_cast<unsigned char>((v1 << 4) | (v2 >> 2)));
+            if (v3 >= 0) out.push_back(static_cast<unsigned char>((v2 << 6) | v3));
+        }
+        return out;
+    };
+
+    auto sig = b64_decode(sig_b64);
+    if (sig.empty()) return false;
+
+    EVP_PKEY* pub = make_pub_key();
+    struct MdDel { void operator()(EVP_MD_CTX* p) const { EVP_MD_CTX_free(p); } };
+    std::unique_ptr<EVP_MD_CTX, MdDel> ctx(EVP_MD_CTX_new());
+    if (!ctx) return false;
+    if (EVP_DigestVerifyInit(ctx.get(), nullptr, EVP_sha256(), nullptr, pub) != 1)
+        return false;
+    if (EVP_DigestVerifyUpdate(ctx.get(), msg.data(), msg.size()) != 1)
+        return false;
+    return EVP_DigestVerifyFinal(ctx.get(), sig.data(), sig.size()) == 1;
+}
+
+static std::vector<unsigned char> b64_decode_bytes(const std::string& b64)
+{
+    std::vector<unsigned char> out;
+    out.reserve(b64.size() * 3 / 4);
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    for (std::size_t i = 0; i + 4 <= b64.size(); i += 4) {
+        int v0 = val(b64[i]), v1 = val(b64[i+1]);
+        int v2 = val(b64[i+2]), v3 = val(b64[i+3]);
+        if (v0 < 0 || v1 < 0) break;
+        out.push_back(static_cast<unsigned char>((v0 << 2) | (v1 >> 4)));
+        if (v2 >= 0) out.push_back(static_cast<unsigned char>((v1 << 4) | (v2 >> 2)));
+        if (v3 >= 0) out.push_back(static_cast<unsigned char>((v2 << 6) | v3));
+    }
+    return out;
+}
+
+// Decrypt a blockwise RSA-PKCS#1 v1.5 base64 blob with g_test_key's private
+// component (mirrors what the printer firmware does with param_enc/url_enc).
+static std::string rsa_decrypt_blocks_b64(const std::string& b64)
+{
+    std::vector<unsigned char> ct = b64_decode_bytes(b64);
+    const int key_bytes = EVP_PKEY_size(g_test_key);
+    if (key_bytes <= 0 || ct.size() % static_cast<std::size_t>(key_bytes) != 0)
+        return {};
+    struct CtxDel { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+    std::string out;
+    for (std::size_t off = 0; off < ct.size(); off += key_bytes) {
+        std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(g_test_key, nullptr));
+        if (!ctx) return {};
+        if (EVP_PKEY_decrypt_init(ctx.get()) != 1) return {};
+        if (EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) != 1) return {};
+        std::size_t plen = 0;
+        if (EVP_PKEY_decrypt(ctx.get(), nullptr, &plen,
+                             ct.data() + off, key_bytes) != 1) return {};
+        std::vector<unsigned char> pt(plen);
+        if (EVP_PKEY_decrypt(ctx.get(), pt.data(), &plen,
+                             ct.data() + off, key_bytes) != 1) return {};
+        out.append(reinterpret_cast<const char*>(pt.data()), plen);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+static int test_non_print_passthrough()
+{
+    // system, info, upgrade, etc. must pass through unchanged.
+    const std::string sys  = R"({"system":{"command":"get_access_code"}})";
+    const std::string info = R"({"info":{"command":"get_version"}})";
+    CHECK(obn::signing::maybe_sign(sys)  == sys);
+    CHECK(obn::signing::maybe_sign(info) == info);
+    return 0;
+}
+
+static int test_print_payload_gets_header()
+{
+    const std::string payload = R"({"print":{"command":"pause","sequence_id":"1"}})";
+    const std::string env     = obn::signing::maybe_sign(payload);
+    CHECK(env != payload);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("header.cert_id").kind()     == obn::json::Value::Kind::String);
+    CHECK(val->find("header.sign_alg").kind()    == obn::json::Value::Kind::String);
+    CHECK(val->find("header.sign_string").kind() == obn::json::Value::Kind::String);
+    return 0;
+}
+
+static int test_cert_id_constant()
+{
+    const std::string payload = R"({"print":{"command":"pause","sequence_id":"2"}})";
+    const std::string env     = obn::signing::maybe_sign(payload);
+    // MQTT envelope: serial.lower() + issuer_RFC2253 (no separator), from leaf.
+    CHECK(envelope_field(env, "cert_id")
+          == "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com");
+    return 0;
+}
+
+static int test_app_certification_id_http_format()
+{
+    // HTTP x-bbl-app-certification-id is issuer + ":" + serial.lower(),
+    // from the same leaf (serial ends in hex 'f' — must not be swallowed).
+    CHECK(obn::signing::app_certification_id()
+          == "CN=GLOF3813734089.bambulab.com:a4e8faaa1a38e3650a0ea590d192383f");
+    return 0;
+}
+
+// Write a self-signed leaf with the production-shaped serial/issuer used by
+// cert_id assertions. Returns false on any OpenSSL failure.
+static bool write_test_slicer_cert(const char* path, EVP_PKEY* key)
+{
+    X509* cert = X509_new();
+    if (!cert) return false;
+    if (X509_set_version(cert, 2) != 1) { X509_free(cert); return false; }
+
+    // serial = 0xa4e8faaa1a38e3650a0ea590d192383f (ends in hex 'f')
+    BIGNUM* bn = nullptr;
+    if (BN_hex2bn(&bn, "a4e8faaa1a38e3650a0ea590d192383f") == 0 || !bn) {
+        X509_free(cert);
+        return false;
+    }
+    ASN1_INTEGER* ai = BN_to_ASN1_INTEGER(bn, nullptr);
+    BN_free(bn);
+    if (!ai || X509_set_serialNumber(cert, ai) != 1) {
+        ASN1_INTEGER_free(ai);
+        X509_free(cert);
+        return false;
+    }
+    ASN1_INTEGER_free(ai);
+
+    X509_NAME* name = X509_NAME_new();
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("GLOF3813734089.bambulab.com"),
+            -1, -1, 0) != 1) {
+        X509_NAME_free(name);
+        X509_free(cert);
+        return false;
+    }
+    // Self-signed: subject == issuer (RFC2253 prints CN=…).
+    if (X509_set_subject_name(cert, name) != 1 ||
+        X509_set_issuer_name(cert, name) != 1) {
+        X509_NAME_free(name);
+        X509_free(cert);
+        return false;
+    }
+    X509_NAME_free(name);
+
+    if (!X509_gmtime_adj(X509_getm_notBefore(cert), 0) ||
+        !X509_gmtime_adj(X509_getm_notAfter(cert), 60 * 60 * 24 * 365) ||
+        X509_set_pubkey(cert, key) != 1 ||
+        X509_sign(cert, key, EVP_sha256()) == 0) {
+        X509_free(cert);
+        return false;
+    }
+
+    FILE* f = std::fopen(path, "w");
+    if (!f) { X509_free(cert); return false; }
+    const int ok = PEM_write_X509(f, cert);
+    std::fclose(f);
+    X509_free(cert);
+    return ok == 1;
+}
+
+static int test_sign_alg_and_ver()
+{
+    const std::string payload = R"({"print":{"command":"stop","sequence_id":"3"}})";
+    const std::string env     = obn::signing::maybe_sign(payload);
+    CHECK(envelope_field(env, "sign_alg") == "RSA_SHA256");
+    CHECK(envelope_field(env, "sign_ver") == "v1.0");
+    return 0;
+}
+
+static int test_payload_len_matches_to_sign()
+{
+    // payload_len must equal the byte length of {"print":{...sorted...}}.
+    const std::string payload = R"({"print":{"z_key":"last","a_key":"first","sequence_id":"4"}})";
+    const std::string env     = obn::signing::maybe_sign(payload);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    // Reconstruct what to_sign would be: {"print":{sorted keys}}.
+    // After parsing and re-dumping with json_lite (Object = std::map), keys
+    // are alphabetically ordered: a_key < sequence_id < z_key.
+    std::string expected_to_sign = R"({"print":{"a_key":"first","sequence_id":"4","z_key":"last"}})";
+    double plen = val->find("header.payload_len").as_number();
+    CHECK(static_cast<std::size_t>(plen) == expected_to_sign.size());
+    return 0;
+}
+
+static int test_signature_verifies()
+{
+    // The sign_string in the envelope must verify against the sorted print
+    // block using the test keypair's public component.
+    const std::string payload = R"({"print":{"command":"resume","sequence_id":"5"}})";
+    const std::string env     = obn::signing::maybe_sign(payload);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+
+    const std::string sig_b64 = val->find("header.sign_string").as_string();
+    CHECK(!sig_b64.empty());
+
+    // Reconstruct to_sign from the envelope's sorted print block.
+    std::string print_dump = val->find("print").dump();
+    std::string to_sign    = "{\"print\":" + print_dump + "}";
+
+    CHECK(verify_b64_sig(to_sign, sig_b64));
+    return 0;
+}
+
+static int test_keys_sorted_in_envelope()
+{
+    // Verify that the envelope's print block has alphabetically sorted keys,
+    // confirming the to_sign builder uses the sorted dump.
+    const std::string payload = R"({"print":{"z_last":"Z","a_first":"A","m_mid":"M","sequence_id":"6"}})";
+    const std::string env     = obn::signing::maybe_sign(payload);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+
+    // Re-dump the print block and check key ordering in the string.
+    std::string dumped = val->find("print").dump();
+    CHECK(dumped.find("\"a_first\"") < dumped.find("\"m_mid\""));
+    CHECK(dumped.find("\"m_mid\"")   < dumped.find("\"sequence_id\""));
+    CHECK(dumped.find("\"sequence_id\"") < dumped.find("\"z_last\""));
+    return 0;
+}
+
+static int test_sign_bytes_length()
+{
+    // RSA-2048 produces a 256-byte signature → 344 base64 characters.
+    const std::string sig = obn::signing::sign_bytes("hello world");
+    CHECK(sig.size() == 344);
+    return 0;
+}
+
+static int test_sign_bytes_deterministic()
+{
+    // RSA-PKCS#1 v1.5 is deterministic; same input must produce same output.
+    const std::string data = "determinism check";
+    CHECK(obn::signing::sign_bytes(data) == obn::signing::sign_bytes(data));
+    return 0;
+}
+
+static int test_sign_bytes_verifies()
+{
+    const std::string data  = "sign_bytes verification";
+    const std::string sig   = obn::signing::sign_bytes(data);
+    CHECK(verify_b64_sig(data, sig));
+    return 0;
+}
+
+static int test_device_security_sign_is_raw_timestamp()
+{
+    // device_security_sign() must reproduce the proprietary plugin's scheme: a
+    // RAW RSA PKCS#1 v1.5 signature over the current epoch-ms decimal string
+    // (no SHA-256, no DigestInfo). Recovering it must yield exactly that
+    // string — matching the real observed POST /my/task signature, which
+    // recovered to the bare ms timestamp "1782788656000".
+    const std::string sig_b64 = obn::signing::device_security_sign();
+    CHECK(sig_b64.size() == 344);  // RSA-2048 -> 256 bytes -> 344 base64 chars
+
+    std::vector<unsigned char> sig;
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    for (std::size_t i = 0; i + 4 <= sig_b64.size(); i += 4) {
+        int v0 = val(sig_b64[i]),   v1 = val(sig_b64[i+1]);
+        int v2 = val(sig_b64[i+2]), v3 = val(sig_b64[i+3]);
+        if (v0 < 0 || v1 < 0) break;
+        sig.push_back(static_cast<unsigned char>((v0 << 2) | (v1 >> 4)));
+        if (v2 >= 0) sig.push_back(static_cast<unsigned char>((v1 << 4) | (v2 >> 2)));
+        if (v3 >= 0) sig.push_back(static_cast<unsigned char>((v2 << 6) | v3));
+    }
+    CHECK(sig.size() == 256);
+
+    // Raw PKCS#1 recover (no digest) with the test key's public component.
+    struct CtxDel { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(g_test_key, nullptr));
+    CHECK(ctx != nullptr);
+    CHECK(EVP_PKEY_verify_recover_init(ctx.get()) == 1);
+    CHECK(EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) == 1);
+    std::size_t rlen = 0;
+    CHECK(EVP_PKEY_verify_recover(ctx.get(), nullptr, &rlen, sig.data(), sig.size()) == 1);
+    std::vector<unsigned char> rec(rlen);
+    CHECK(EVP_PKEY_verify_recover(ctx.get(), rec.data(), &rlen, sig.data(), sig.size()) == 1);
+    rec.resize(rlen);
+    const std::string msg(rec.begin(), rec.end());
+
+    // The recovered message is the bare ms-timestamp string (same shape as the
+    // real example), NOT a SHA-256 DigestInfo block.
+    CHECK(msg.size() >= 12 && msg.size() <= 14);
+    for (char c : msg) CHECK(c >= '0' && c <= '9');
+    CHECK(std::stoll(msg) > 1700000000000LL);  // plausible recent epoch-ms
+    return 0;
+}
+
+static int test_gcode_line_param_encrypted()
+{
+    // Secured printer (developer_mode=0, the default): gcode_line gains
+    // `param_enc` and the cleartext `param` is DROPPED — secured firmware
+    // reads only *_enc and rejects a message carrying both (err 84033545).
+    // The signature covers the param_enc-only print block.
+    const std::string gcode   = "M104 S220\n"; // real newline after JSON decode
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"M104 S220\n","sequence_id":"7"}})";
+    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.param").kind()          == obn::json::Value::Kind::Null); // dropped
+    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val->find("print.param_enc").as_string()) == gcode);
+    std::string to_sign = "{\"print\":" + val->find("print").dump() + "}";
+    CHECK(verify_b64_sig(to_sign, val->find("header.sign_string").as_string()));
+    return 0;
+}
+
+static int test_developer_mode_keeps_cleartext()
+{
+    // Developer Mode (maybe_sign developer_mode=true): firmware ignores *_enc
+    // and reads cleartext, so the cleartext param must be KEPT alongside
+    // param_enc.
+    const std::string gcode   = "G28\n";
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"G28\n","sequence_id":"7b"}})";
+    const std::string env =
+        obn::signing::maybe_sign(payload, g_test_key, /*developer_mode=*/true);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.param").as_string()     == gcode);       // kept
+    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val->find("print.param_enc").as_string()) == gcode);
+    return 0;
+}
+
+static int test_project_file_url_encrypted_secured_drops()
+{
+    // Secured printer (default): project_file gains url_enc and the cleartext
+    // url is DROPPED. `param` (plate path) is never encrypted: the firmware
+    // reads it in cleartext and fails with 0500-4003 without it.
+    const std::string url   = "https://example.com/model.3mf?sig=abc";
+    const std::string param = "Metadata/plate_1.gcode";
+    const std::string payload =
+        R"({"print":{"command":"project_file","param":")" + param +
+        R"(","url":")" + url + R"(","sequence_id":"8"}})";
+    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.url").kind()            == obn::json::Value::Kind::Null); // dropped
+    CHECK(val->find("print.url_enc").kind()        == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val->find("print.url_enc").as_string()) == url);
+    CHECK(val->find("print.param").as_string()     == param);                        // kept
+    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_project_file_no_key_keeps_url()
+{
+    // Without a device key, url is not encrypted and must NOT be dropped
+    // (the pure-LAN plaintext ftp:// path relies on the cleartext url).
+    const std::string payload =
+        R"({"print":{"command":"project_file","url":"ftp://model.3mf","sequence_id":"8b"}})";
+    const std::string env = obn::signing::maybe_sign(payload); // no key
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.url").as_string() == "ftp://model.3mf"); // kept
+    CHECK(val->find("print.url_enc").kind()  == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_no_device_key_leaves_cleartext()
+{
+    // Without a device key, url/param are not transformed.
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"G28\n","url":"ftp://x","sequence_id":"9"}})";
+    const std::string env = obn::signing::maybe_sign(payload); // no key
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.param").kind()     == obn::json::Value::Kind::String);
+    CHECK(val->find("print.param_enc").kind() == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.url_enc").kind()   == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_param_enc_idempotent()
+{
+    // If param_enc already exists, the transform must not touch param/param_enc.
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"G28\n","param_enc":"PREBUILT","sequence_id":"10"}})";
+    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.param_enc").as_string() == "PREBUILT");
+    CHECK(val->find("print.param").kind()          == obn::json::Value::Kind::String);
+    return 0;
+}
+
+static int test_blockwise_multiblock_roundtrip()
+{
+    // A plaintext longer than one RSA-2048 PKCS#1 block (245 B) must span
+    // multiple 256-byte blocks and decrypt back byte-for-byte.
+    std::string big(600, 'x');
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('0' + (i % 10));
+    std::string err;
+    std::string b64 = obn::signing::rsa_pkcs1v15_encrypt_b64(g_test_key, big, &err);
+    CHECK(!b64.empty());
+    CHECK(b64_decode_bytes(b64).size() == 3 * 256); // 600 B -> 3 blocks (245*3=735>=600)
+    CHECK(rsa_decrypt_blocks_b64(b64) == big);
+    return 0;
+}
+
+static int test_liveview_prepare_ttcode_encrypted()
+{
+    const std::string ttcode = "VGC47JEVNKCHC9RZ111A";
+    const std::string payload =
+        R"({"liveview":{"authkey":"c0c597fc","command":"prepare","passwd":"a71c21","region":"us","sequence_id":"21143","ttcode":")" +
+        ttcode + R"("}})";
+
+    // Secured printer (developer_mode = false): ttcode_enc added, cleartext ttcode dropped.
+    const std::string env_sec = obn::signing::maybe_sign(payload, g_test_key, /*developer_mode=*/false);
+    auto val_sec = obn::json::parse(env_sec);
+    CHECK(val_sec);
+    CHECK(val_sec->find("header.sign_string").kind() == obn::json::Value::Kind::String);
+    CHECK(val_sec->find("liveview.ttcode").kind()    == obn::json::Value::Kind::Null);
+    CHECK(val_sec->find("liveview.ttcode_enc").kind() == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val_sec->find("liveview.ttcode_enc").as_string()) == ttcode);
+    CHECK(val_sec->find("liveview.authkey").as_string() == "c0c597fc");
+    CHECK(val_sec->find("liveview.passwd").as_string()  == "a71c21");
+
+    // Developer Mode printer (developer_mode = true): ttcode_enc added, cleartext ttcode kept.
+    const std::string env_dev = obn::signing::maybe_sign(payload, g_test_key, /*developer_mode=*/true);
+    auto val_dev = obn::json::parse(env_dev);
+    CHECK(val_dev);
+    CHECK(val_dev->find("liveview.ttcode").as_string()  == ttcode);
+    CHECK(val_dev->find("liveview.ttcode_enc").kind()  == obn::json::Value::Kind::String);
+    return 0;
+}
+
+namespace obn::config {
+    Settings& test_settings();
+    std::string& test_dir();
+}
+
+static int test_trailing_sibling_reconstruction()
+{
+    // SIGN-03: trailing sibling AFTER the root key is now SIGNED and EMITTED —
+    // to_sign == envelope-minus-header including user_id (farm consensus,
+    // research/10.04 §Signing consensus). Replaces the earlier drop-pin.
+    const std::string payload =
+        R"({"print":{"command":"pause","sequence_id":"11"},"user_id":"u_42"})";
+    const std::string env = obn::signing::maybe_sign(payload); // no device key → hermetic
+    CHECK(env != payload);                       // signed, not passed through
+    auto val = obn::json::parse(env);
+    CHECK(val);
+
+    // (1) Byte-exact wire match via the FIRMWARE reconstruction rule
+    // ("{" + everything from the "print" key to the final '}' — 10.04):
+    std::size_t kpos = env.find("\"print\":");
+    CHECK(kpos != std::string::npos);
+    std::string to_sign = "{" + env.substr(kpos);   // root + trailing sibling
+    double plen = val->find("header.payload_len").as_number();
+    CHECK(static_cast<std::size_t>(plen) == to_sign.size());
+
+    // (2) Signature round-trip against that reconstruction.
+    CHECK(verify_b64_sig(to_sign, val->find("header.sign_string").as_string()));
+
+    // (3) Sibling PRESENT at the envelope top level, outside `print`.
+    CHECK(val->find("user_id").kind() == obn::json::Value::Kind::String);
+    CHECK(val->find("user_id").as_string() == "u_42");
+    CHECK(env.find("\"user_id\"") != std::string::npos);
+    CHECK(val->find("print.user_id").kind() == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+int main()
+{
+    // Generate fresh RSA-2048 keypair for signing tests.
+    g_test_key = EVP_RSA_gen(2048);
+    if (!g_test_key) { std::cerr << "EVP_RSA_gen failed\n"; return 1; }
+
+    // Write private key to a temp PEM file and point the config at it.
+#ifdef _WIN32
+    // Per-run unique temp path — never a fixed predictable filename: the
+    // XXXXXX template is uniquified per run, then created with _O_EXCL so
+    // parallel/repeated runs cannot clobber each other's key files.
+    char tmp_path[512];
+    const char* tmp_dir = std::getenv("TEMP");
+    std::snprintf(tmp_path, sizeof(tmp_path), "%s\\signing_test_XXXXXX",
+                  (tmp_dir && *tmp_dir) ? tmp_dir : ".");
+    if (_mktemp_s(tmp_path, sizeof(tmp_path)) != 0) {
+        std::cerr << "_mktemp_s failed\n";
+        EVP_PKEY_free(g_test_key);
+        return 1;
+    }
+    int fd = _open(tmp_path, _O_CREAT | _O_EXCL | _O_WRONLY, 0600);
+    if (fd < 0) { std::cerr << "_open temp failed\n"; EVP_PKEY_free(g_test_key); return 1; }
+    close(fd);
+#else
+    char tmp_path[] = "/tmp/signing_test_XXXXXX";
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) { std::cerr << "mkstemp failed\n"; EVP_PKEY_free(g_test_key); return 1; }
+    close(fd);
+#endif
+    std::string pem_path = std::string(tmp_path) + ".pem";
+
+    int pem_fd = open(pem_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    FILE* f = (pem_fd >= 0) ? fdopen(pem_fd, "w") : nullptr;
+    if (!f) { perror("open pem"); EVP_PKEY_free(g_test_key); return 1; }
+    PEM_write_PrivateKey(f, g_test_key, nullptr, nullptr, 0, nullptr, nullptr);
+    fclose(f);
+    unlink(tmp_path);
+
+    const std::string cert_path = pem_path + ".cert.pem";
+    if (!write_test_slicer_cert(cert_path.c_str(), g_test_key)) {
+        std::cerr << "write_test_slicer_cert failed\n";
+        unlink(pem_path.c_str());
+        EVP_PKEY_free(g_test_key);
+        return 1;
+    }
+
+    obn::config::test_settings().slicer_key_pem  = pem_path;
+    obn::config::test_settings().slicer_cert_pem = cert_path;
+
+    int rc = 0;
+    if (test_non_print_passthrough()       != 0) rc = 1;
+    if (test_print_payload_gets_header()   != 0) rc = 1;
+    if (test_cert_id_constant()            != 0) rc = 1;
+    if (test_app_certification_id_http_format() != 0) rc = 1;
+    if (test_sign_alg_and_ver()            != 0) rc = 1;
+    if (test_payload_len_matches_to_sign() != 0) rc = 1;
+    if (test_signature_verifies()          != 0) rc = 1;
+    if (test_keys_sorted_in_envelope()     != 0) rc = 1;
+    if (test_sign_bytes_length()           != 0) rc = 1;
+    if (test_sign_bytes_deterministic()    != 0) rc = 1;
+    if (test_sign_bytes_verifies()         != 0) rc = 1;
+    if (test_device_security_sign_is_raw_timestamp() != 0) rc = 1;
+    if (test_gcode_line_param_encrypted()  != 0) rc = 1;
+    if (test_developer_mode_keeps_cleartext() != 0) rc = 1;
+    if (test_project_file_url_encrypted_secured_drops() != 0) rc = 1;
+    if (test_project_file_no_key_keeps_url() != 0) rc = 1;
+    if (test_no_device_key_leaves_cleartext() != 0) rc = 1;
+    if (test_param_enc_idempotent()        != 0) rc = 1;
+    if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
+    if (test_liveview_prepare_ttcode_encrypted() != 0) rc = 1;
+    if (test_trailing_sibling_reconstruction() != 0) rc = 1;
+
+    if (rc == 0) std::cout << "signing_test: ok\n";
+
+    // Cleanup.
+    unlink(pem_path.c_str());
+    unlink(cert_path.c_str());
+    EVP_PKEY_free(g_test_key);
+    return rc;
+}

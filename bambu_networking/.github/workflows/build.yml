@@ -1,0 +1,479 @@
+# Build and test open-bamboo-networking on Linux x64 / aarch64,
+# Windows x64 + ARM64 (MSVC + vcpkg manifest), and macOS arm64.
+# release.yml always builds both macOS architectures.
+#
+# Version strategy: the plugin must report a string whose first 8 characters
+# match Bambu Studio's SLIC3R_VERSION. We therefore look up the most recent
+# tag in https://github.com/bambulab/BambuStudio.git at CI time, strip the
+# leading "v", and bump the last component to "99" (same rule ./configure
+# uses for local auto-detection). This means CI follows upstream releases
+# automatically -- no manual version bumps in this repo.
+#
+# Linux artifacts (one set per ABI version / architecture):
+#   * libbambu_networking.so
+#   * libBambuSource.so
+#   * liblive555.so
+#   * network_plugins.json
+#
+# Windows artifacts (one set per ABI version / architecture — x64 and ARM64):
+#   * bambu_networking.dll
+#   * BambuSource.dll
+#   * live555.dll (stub)
+#   * network_plugins.json
+#   * ota/plugins/
+#
+# macOS artifacts (one set per ABI version / architecture):
+#   * libbambu_networking.dylib
+#   * libBambuSource.dylib
+#   * liblive555.dylib
+#   * network_plugins.json
+
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: 'ABI version (default: 02.08.02, or "all")'
+        required: false
+        default: '02.08.02'
+      arch:
+        description: 'Architecture (x64, arm64, all)'
+        required: false
+        default: 'x64'
+      target_os:
+        description: 'Target OS (windows, linux, macos, all)'
+        required: false
+        default: 'windows'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  discover-abi:
+    name: Discover ABI versions
+    runs-on: ubuntu-24.04
+    outputs:
+      abi-matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: List ABI versions from abi_snapshot dirs
+        id: list
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.abi }}" != "all" ] && [ -n "${{ inputs.abi }}" ]; then
+            VERSIONS=$(jq -nc --arg v "${{ inputs.abi }}" '[$v]')
+          else
+            VERSIONS=$(ls -d tools/abi_snapshot/v*/ \
+              | sed 's|.*/v||; s|/$||' \
+              | jq -Rnc '[inputs]')
+          fi
+          echo "matrix=$VERSIONS" >> "$GITHUB_OUTPUT"
+          echo "Discovered ABI versions: $VERSIONS"
+
+  build:
+    name: v${{ matrix.abi }}.xx-linux-${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.target_os == 'all' || inputs.target_os == 'linux'
+    needs: [discover-abi]
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(needs.discover-abi.outputs.abi-matrix) }}
+        arch:
+          - x64
+          - aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config ca-certificates git \
+            libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
+
+      - name: Configure
+        run: |
+          ./configure \
+            --build-type=Release \
+            --enable-tests \
+            --with-version='${{ matrix.abi }}.99' \
+            --no-conf-patch
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run tests
+        # The only ctest target that does real I/O is `lan_live`, and it
+        # self-skips when OBN_PRINTER_IP / _SERIAL / _ACCESS_CODE are unset,
+        # which is always the case here. `plugin_symbols` is a pure dlopen
+        # smoke test and exercises every ABI symbol Studio looks up.
+        run: make test
+
+      - name: Verify built plugin exports every ABI symbol
+        # Nightly abi-compat workflow compares source-side files only.
+        # This step additionally nm's the freshly built .so to confirm we
+        # did not lose any exported entry point in this architecture's toolchain.
+        # --abi pins the check to the ABI this job actually built, so a plugin
+        # is never verified against a different (e.g. newer) ABI's symbol list.
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.so
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/libbambu_networking.so dist/
+          cp build/libBambuSource.so      dist/
+          cp build/liblive555.so          dist/
+          cp build/network_plugins.json   dist/
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-linux-v${{ matrix.abi }}.xx-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  build-windows:
+    name: v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.target_os == 'all' || inputs.target_os == 'windows'
+    needs: [discover-abi]
+    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(needs.discover-abi.outputs.abi-matrix) }}
+        arch: ${{ (github.event_name == 'workflow_dispatch' && inputs.arch == 'x64') && fromJSON('["x64"]') || (github.event_name == 'workflow_dispatch' && inputs.arch == 'arm64') && fromJSON('["arm64"]') || fromJSON('["x64", "arm64"]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:GITHUB_WORKSPACE "install"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          $arch = '${{ matrix.arch }}'
+          $cmakeArch = if ($arch -eq 'arm64') { 'ARM64' } else { 'x64' }
+          $triplet = if ($arch -eq 'arm64') { 'arm64-windows-static-md' } else { 'x64-windows-static-md' }
+          .\configure.ps1 `
+            -ClientType bambu_studio `
+            -WithVersion '${{ matrix.abi }}.99' `
+            -Prefix $staging `
+            -Architecture $cmakeArch `
+            -VcpkgTriplet $triplet `
+            -PatchConf:$false `
+            -RegisterDShowFilter:$false `
+            -EnableTests:$true
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build --config Release --parallel
+
+      - name: Test (probe_plugin)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location build
+          ctest -C Release --output-on-failure
+          Pop-Location
+
+      - name: Install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --install build --config Release
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE "install"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item -Path (Join-Path $src 'plugins\*') -Destination $dist -Force
+          $ota = Join-Path $src 'ota'
+          if (Test-Path $ota) {
+            Copy-Item -Path $ota -Destination (Join-Path $dist 'ota') -Recurse -Force
+          }
+          Get-ChildItem -Recurse $dist | Format-Table FullName,Length -AutoSize
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  build-macos:
+    name: v${{ matrix.abi }}.xx-macos-arm64
+    if: github.event_name != 'workflow_dispatch' || inputs.target_os == 'all' || inputs.target_os == 'macos'
+    needs: [discover-abi]
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(needs.discover-abi.outputs.abi-matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          set -eu
+          # curl/cjson/zlib are NOT brew runtime deps: libcurl is vendored
+          # static, cJSON is vendored with mosquitto, zlib is system.
+          # openssl@3 is build-time only: we link its static .a archives.
+          for pkg in pkg-config cmake openssl@3 uthash; do
+            brew list "$pkg" &>/dev/null || brew install "$pkg"
+          done
+          {
+            echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
+            echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          ./configure \
+            --build-type=Release \
+            --enable-tests \
+            --with-version='${{ matrix.abi }}.99' \
+            --no-conf-patch
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Run tests
+        run: make test
+
+      - name: Verify built plugin exports every ABI symbol
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
+
+      - name: Assert no Homebrew runtime dylib deps
+        run: |
+          set -eu
+          # Static OpenSSL + vendored curl must leave no /opt/homebrew or
+          # /usr/local/opt NEEDED entries (issue #60).
+          bad=0
+          for dylib in build/libbambu_networking.dylib build/libBambuSource.dylib; do
+            echo "== otool -L $dylib =="
+            otool -L "$dylib"
+            if otool -L "$dylib" | grep -E '/opt/homebrew/|/usr/local/opt/'; then
+              echo "error: $dylib still links Homebrew paths" >&2
+              bad=1
+            fi
+          done
+          exit "$bad"
+
+      - name: Verify BambuPlayer ObjC class is exported
+        run: |
+          set -eu
+          nm -gU build/libBambuSource.dylib | grep '_OBJC_CLASS_\$_BambuPlayer'
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/libbambu_networking.dylib dist/
+          cp build/libBambuSource.dylib      dist/
+          cp build/liblive555.dylib          dist/
+          cp build/network_plugins.json      dist/
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-macos-arm64-v${{ matrix.abi }}.xx
+          path: dist/
+          if-no-files-found: error
+
+  # build-macos-intel:
+  #   name: v${{ matrix.abi }}.xx-macos-x64
+  #   # Uncomment this job to enable Intel macOS interim builds (macos-latest-large).
+  #   needs: [discover-abi]
+  #   runs-on: macos-latest-large
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       abi: ${{ fromJSON(needs.discover-abi.outputs.abi-matrix) }}
+  #
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v6
+  #
+  #     - name: Install build dependencies
+  #       run: |
+  #         set -eu
+  #         for pkg in pkg-config cmake openssl@3 uthash; do
+  #           brew list "$pkg" &>/dev/null || brew install "$pkg"
+  #         done
+  #         {
+  #           echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
+  #           echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig"
+  #         } >> "$GITHUB_ENV"
+  #
+  #     - name: Configure
+  #       run: |
+  #         ./configure \
+  #           --build-type=Release \
+  #           --enable-tests \
+  #           --with-version='${{ matrix.abi }}.99' \
+  #           --no-conf-patch
+  #
+  #     - name: Build
+  #       run: make -j"$(sysctl -n hw.ncpu)"
+  #
+  #     - name: Run tests
+  #       run: make test
+  #
+  #     - name: Verify built plugin exports every ABI symbol
+  #       run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
+  #
+  #     - name: Assert no Homebrew runtime dylib deps
+  #       run: |
+  #         set -eu
+  #         bad=0
+  #         for dylib in build/libbambu_networking.dylib build/libBambuSource.dylib; do
+  #           echo "== otool -L $dylib =="
+  #           otool -L "$dylib"
+  #           if otool -L "$dylib" | grep -E '/opt/homebrew/|/usr/local/opt/'; then
+  #             echo "error: $dylib still links Homebrew paths" >&2
+  #             bad=1
+  #           fi
+  #         done
+  #         exit "$bad"
+  #
+  #     - name: Stage artifacts
+  #       run: |
+  #         set -eu
+  #         mkdir -p dist
+  #         cp build/libbambu_networking.dylib dist/
+  #         cp build/libBambuSource.dylib      dist/
+  #         cp build/liblive555.dylib          dist/
+  #         cp build/network_plugins.json      dist/
+  #         ls -l dist/
+  #
+  #     - name: Upload artifacts
+  #       uses: actions/upload-artifact@v6
+  #       with:
+  #         name: obn-macos-x64-v${{ matrix.abi }}.xx
+  #         path: dist/
+  #         if-no-files-found: error
+
+  package:
+    name: Package distributions
+    needs: [build, build-windows, build-macos]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.build-macos.result == 'success'
+# && (needs.build-macos-intel.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts/
+
+      - name: Assemble distribution archives
+        run: scripts/package-dist.sh artifacts dist-out
+
+      - name: Upload distribution archives
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-distributions
+          path: |
+            dist-out/*.tar.gz
+            dist-out/*.zip
+          if-no-files-found: error
+
+  pages:
+    name: Deploy download page
+    needs: [package]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download distribution archives
+        uses: actions/download-artifact@v6
+        with:
+          name: obn-distributions
+          path: dist-out/
+
+      - name: Generate download page
+        run: |
+          set -eu
+          mkdir -p site
+
+          COMMIT="${GITHUB_SHA}"
+          SHORT="${COMMIT:0:7}"
+          DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          REPO="${GITHUB_REPOSITORY}"
+
+          # Build table rows from archive files
+          ROWS=""
+          for f in dist-out/*.tar.gz dist-out/*.zip; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            size=$(du -h "$f" | cut -f1)
+            cp "$f" "site/$name"
+
+            # Extract platform from filename
+            case "$name" in
+              *linux-x64*)       platform="Linux x64" ;;
+              *linux-aarch64*)   platform="Linux aarch64" ;;
+              *windows-arm64*)   platform="Windows ARM64" ;;
+              *windows-x64*)     platform="Windows x64" ;;
+              *macos-arm64*)     platform="macOS (Apple Silicon)" ;;
+              *macos-x64*|*macos-intel*) platform="macOS (Intel)" ;;
+              *)                 platform="$name" ;;
+            esac
+
+            ROWS="${ROWS}<tr><td>${platform}</td>"
+            ROWS="${ROWS}<td><a href=\"${name}\">${name}</a></td>"
+            ROWS="${ROWS}<td>${size}</td></tr>\n"
+          done
+
+          sed \
+            -e "s|@COMMIT@|${COMMIT}|g" \
+            -e "s|@SHORT_COMMIT@|${SHORT}|g" \
+            -e "s|@DATE@|${DATE}|g" \
+            -e "s|@REPO@|${REPO}|g" \
+            -e "s|@TABLE_ROWS@|${ROWS}|g" \
+            packaging/pages-index.html.in > site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,349 @@
+# Build a release distribution and create a draft GitHub Release.
+#
+# Mirrors the interim build.yml pipeline but with OBN_RELEASE=ON so the plugin
+# reports the project version instead of a commit hash. Triggered by pushing a
+# version tag (v*) or manually via workflow_dispatch.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0rc1)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Verify version tag
+    runs-on: ubuntu-24.04
+    outputs:
+      abi-matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check tag matches version.hpp
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          HPP_VERSION=$(sed -n 's/.*OBN_PROJECT_VERSION "\([^"]*\)".*/\1/p' include/obn/version.hpp)
+          if [ -z "$HPP_VERSION" ]; then
+            echo "::error::Cannot parse OBN_PROJECT_VERSION from include/obn/version.hpp"
+            exit 1
+          fi
+          if [ "$TAG" != "$HPP_VERSION" ]; then
+            echo "::error::Tag '$TAG' does not match version in include/obn/version.hpp ('$HPP_VERSION')"
+            exit 1
+          fi
+          echo "Version check passed: $TAG"
+
+      - name: List ABI versions from abi_snapshot dirs
+        id: list
+        run: |
+          VERSIONS=$(ls -d tools/abi_snapshot/v*/ \
+            | sed 's|.*/v||; s|/$||' \
+            | jq -Rnc '[inputs]')
+          echo "matrix=$VERSIONS" >> "$GITHUB_OUTPUT"
+          echo "Discovered ABI versions: $VERSIONS"
+
+  build:
+    name: v${{ matrix.abi }}.xx-linux-${{ matrix.arch }}
+    needs: [preflight]
+    runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(needs.preflight.outputs.abi-matrix) }}
+        arch:
+          - x64
+          - aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config ca-certificates git \
+            libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
+
+      - name: Configure
+        run: |
+          ./configure \
+            --build-type=Release \
+            --enable-tests \
+            --with-version='${{ matrix.abi }}.99' \
+            --no-conf-patch \
+            --cmake-arg=-DOBN_RELEASE=ON
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run tests
+        run: make test
+
+      - name: Verify built plugin exports every ABI symbol
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.so
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/libbambu_networking.so dist/
+          cp build/libBambuSource.so      dist/
+          cp build/liblive555.so          dist/
+          cp build/network_plugins.json   dist/
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-linux-v${{ matrix.abi }}.xx-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  build-windows:
+    name: v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
+    needs: [preflight]
+    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(needs.preflight.outputs.abi-matrix) }}
+        arch:
+          - x64
+          - arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:GITHUB_WORKSPACE "install"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          $arch = '${{ matrix.arch }}'
+          $cmakeArch = if ($arch -eq 'arm64') { 'ARM64' } else { 'x64' }
+          $triplet = if ($arch -eq 'arm64') { 'arm64-windows-static-md' } else { 'x64-windows-static-md' }
+          .\configure.ps1 `
+            -ClientType bambu_studio `
+            -WithVersion '${{ matrix.abi }}.99' `
+            -Prefix $staging `
+            -Architecture $cmakeArch `
+            -VcpkgTriplet $triplet `
+            -PatchConf:$false `
+            -RegisterDShowFilter:$false `
+            -EnableTests:$true
+          # Re-run cmake to inject OBN_RELEASE into the existing build tree
+          cmake build -DOBN_RELEASE=ON
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build --config Release --parallel
+
+      - name: Test (probe_plugin)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location build
+          ctest -C Release --output-on-failure
+          Pop-Location
+
+      - name: Install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --install build --config Release
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE "install"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item -Path (Join-Path $src 'plugins\*') -Destination $dist -Force
+          $ota = Join-Path $src 'ota'
+          if (Test-Path $ota) {
+            Copy-Item -Path $ota -Destination (Join-Path $dist 'ota') -Recurse -Force
+          }
+          Get-ChildItem -Recurse $dist | Format-Table FullName,Length -AutoSize
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  build-macos:
+    name: v${{ matrix.abi }}.xx-macos-${{ matrix.arch }}
+    needs: [preflight]
+    runs-on: ${{ matrix.arch == 'arm64' && 'macos-latest' || 'macos-latest-large' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(needs.preflight.outputs.abi-matrix) }}
+        arch:
+          - arm64
+          - x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          set -eu
+          # curl/cjson/zlib are NOT brew runtime deps: libcurl is vendored
+          # static, cJSON is vendored with mosquitto, zlib is system.
+          # openssl@3 is build-time only: we link its static .a archives.
+          for pkg in pkg-config cmake openssl@3 uthash; do
+            brew list "$pkg" &>/dev/null || brew install "$pkg"
+          done
+          {
+            echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
+            echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          ./configure \
+            --build-type=Release \
+            --enable-tests \
+            --with-version='${{ matrix.abi }}.99' \
+            --no-conf-patch \
+            --cmake-arg=-DOBN_RELEASE=ON
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Run tests
+        run: make test
+
+      - name: Verify built plugin exports every ABI symbol
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
+
+      - name: Assert no Homebrew runtime dylib deps
+        run: |
+          set -eu
+          # Static OpenSSL + vendored curl must leave no /opt/homebrew or
+          # /usr/local/opt NEEDED entries (issue #60).
+          bad=0
+          for dylib in build/libbambu_networking.dylib build/libBambuSource.dylib; do
+            echo "== otool -L $dylib =="
+            otool -L "$dylib"
+            if otool -L "$dylib" | grep -E '/opt/homebrew/|/usr/local/opt/'; then
+              echo "error: $dylib still links Homebrew paths" >&2
+              bad=1
+            fi
+          done
+          exit "$bad"
+
+      - name: Verify BambuPlayer ObjC class is exported
+        run: |
+          set -eu
+          nm -gU build/libBambuSource.dylib | grep '_OBJC_CLASS_\$_BambuPlayer'
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/libbambu_networking.dylib dist/
+          cp build/libBambuSource.dylib      dist/
+          cp build/liblive555.dylib          dist/
+          cp build/network_plugins.json      dist/
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-macos-${{ matrix.arch }}-v${{ matrix.abi }}.xx
+          path: dist/
+          if-no-files-found: error
+
+  package:
+    name: Package distributions
+    needs: [build, build-windows, build-macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts/
+
+      - name: Assemble distribution archives
+        env:
+          OBN_BUILD_TYPE: release
+        run: scripts/package-dist.sh artifacts dist-out
+
+      - name: Upload distribution archives
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-distributions
+          path: |
+            dist-out/*.tar.gz
+            dist-out/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create draft release
+    needs: [package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download distribution archives
+        uses: actions/download-artifact@v6
+        with:
+          name: obn-distributions
+          path: dist-out/
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --notes "Release $TAG" \
+            dist-out/*.tar.gz dist-out/*.zip

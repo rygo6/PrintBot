@@ -1,0 +1,5 @@
+{
+    "version": "@OBN_VERSION@",
+    "description": "Open Bamboo Networking @PROJECT_VERSION@ (opensource replacement)",
+    "force": false
+}

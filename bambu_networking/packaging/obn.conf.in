@@ -1,0 +1,323 @@
+# Open Bamboo Networking -- user settings
+#
+# Log settings can also be set via OBN_LOG_* environment variables;
+# when set, they take priority over this file.
+
+# --- Logging --------------------------------------------------------
+
+log_level = info
+log_stderr = 1
+log_to_file = 0
+log_file =
+
+
+# --- BambuSource logging --------------------------------------------
+#
+# Logging for the BambuSource library (camera liveview / file browser).
+# Same pattern as the main plugin: stderr by default, file on demand.
+# Env vars (OBN_BAMBUSOURCE_LOG_*) override these when set.
+# debug: every slicer call into the library with its result, file-browser
+#   requests and replies, connection steps and timings.
+# trace: adds wire dumps (port 6000 frames, file-browser JSON, TUTK
+#   packets, every video sample). Large; use only while reproducing a
+#   problem. debug/trace lines are not copied into the slicer's own log.
+
+bambusource_log_level = info
+bambusource_log_stderr = 1
+bambusource_log_to_file = 0
+bambusource_log_file =
+
+
+# --- LAN TLS --------------------------------------------------------
+#
+# Skip TLS certificate verification for LAN MQTT/FTPS connections.
+# Despite the name, this also disables certificate and hostname checks on
+# the cloud MQTT connection. Use it as a last resort when cloud MQTT fails
+# TLS verification, e.g. behind a TLS-inspecting corporate proxy or when
+# the CA bundle built into the plugin (Windows) has gone stale.
+
+lan_tls_skip_verify = 0
+
+
+# --- Print behavior -------------------------------------------------
+#
+# Always save timelapse to external storage (USB/SD), ignoring the
+# Internal/External toggle in the print dialog.  Studio defaults
+# that toggle to internal storage, so this avoids switching it every time.
+
+force_timelapse_external = 0
+
+
+# --- File transfer --------------------------------------------------
+#
+# Force FTPS (port 990) for file listing and transfer instead of the
+# native TLS :6000 CTRL protocol.  Thumbnails, timelapse files, and
+# internal storage (eMMC) browsing are not available in this mode.
+# Useful as a workaround when the printer's :6000 file browser is
+# broken (e.g. some A1 firmware versions).  FTPS needs the local network,
+# so for a cloud-bound printer the file browser then skips TUTK and uses
+# the printer's LAN address (it fails if that is unreachable).
+
+force_ftps = 0
+
+
+# --- Device panel camera preview ------------------------------------
+#
+# When live view is off, Studio polls a static JPEG snapshot from the
+# printer RAM (FILE_DOWNLOAD mem:/26 over TLS :6000) and shows it in the
+# large camera area ("Printer Preview …" overlay). Disable if that stale
+# snapshot annoys you — it often shows an outdated picture that does not
+# match what is actually printing.
+
+disable_camera_preview = 0
+
+
+# --- Live view and file browser transport ----------------------------
+#
+# How live view and the file browser (Device -> Storage) reach a printer
+# that is bound to the cloud.  Only matters while block_cloud = 0: in
+# LAN-only mode the slicer connects to the printer locally by itself.
+#
+# 0 (default, like the stock plugin): both go over TUTK, Bambu's P2P
+#   service.  The plugin asks the cloud for TUTK credentials, and the
+#   printer is reached directly (same network or hole punching) or through
+#   a TUTK relay, so this also works away from home.
+# 1: use the printer's local network whenever its IP and access code are
+#   known and it answers there: video over RTSP(S) (MJPEG on port 6000
+#   for A1 / P1), files over port 6000.  Falls back to TUTK when the
+#   printer does not answer locally or has "LAN Only Liveview" off.
+#
+# TUTK credentials are only handed out to a signed slicer request, so
+# without the slicer key/certificate the local network is used either way.
+# With force_ftps = 1 the file browser always uses the local network.
+# If neither path works, the slicer shows "Connection Failed".
+
+prefer_lan_over_tutk = 0
+
+
+# --- Cloud status bootstrap ------------------------------------------
+#
+# Ask every printer for a full status snapshot (pushall) once per cloud
+# session, right after its report subscription goes live.  Without it the
+# device panel stays empty (no AMS trays, no temperatures) until the
+# printer volunteers telemetry on its own, because the slicer only asks
+# for a snapshot after it has already seen one report.  Stock plugins send
+# the same request.  Set to 0 if you would rather keep the cloud session
+# completely silent.
+
+cloud_pushall_on_connect = 1
+
+
+# --- MQTT connection persistence -------------------------------------
+#
+# Keep the MQTT connection alive across the slicer's internal
+# disconnect/reconnect cycles (e.g. after sending a print job).
+# Useful for Orca Slicer, which reconnects to the printer after
+# every print, causing a 5-30s delay on printers with limited
+# MQTT session slots (A1 Mini, P1S, etc.).
+
+mqtt_keep_connection = 1
+
+
+# --- MQTT push_status patches ---------------------------------------
+#
+# Replace the printer's self-reported LAN IP in MQTT push_status with the
+# IP you used to connect.  Enable this when you access the printer through
+# NAT / port forwarding: without it, the slicer sees the printer's
+# internal address (e.g. 192.168.1.100) and fails to open the camera
+# or file browser from outside the LAN.
+#
+# Example NAT setup:
+#   1. Forward ports 8883, 990, 6000 and 322 on your router to the printer.
+#   2. In the slicer, connect using your public IP (or DDNS hostname).
+#   3. Set override_lan_ip = 1 here so the camera and file browser also
+#      use the public IP instead of the printer's internal address.
+
+override_lan_ip = 0
+
+# Patch incoming MQTT push_status fields on the fly. All disabled by
+# default. Enable only if your printer needs it.
+#
+# Rewrite home_flag SD-card bits from NO_SDCARD (0) to HAS_SDCARD (1).
+# Useful on some A-series (and similar) where Studio greys out "Send to
+# Printer" / "Print via LAN" and shows a red storage tile even though
+# USB storage works over FTPS. Many printers (e.g. P2S) do not need this.
+
+patch_mqtt_home_flag = 0
+
+# Inject ipcam.file block into push_status when the firmware omits it.
+# Without this, Studio shows "Browsing file in storage is not supported"
+# or "not supported in lan mode" and refuses to open the file browser.
+# The file browser actually works (at least on A1), the printer
+# just does not advertise the capability in its MQTT status. Only
+# affects printers that do not report ipcam.file natively (e.g. X1/P1S
+# already advertise it and are not affected).
+
+patch_mqtt_ipcam_file = 0
+
+# Set fun2 bit 17 (is_support_model_internal_storage) so Studio shows
+# the internal storage (eMMC) tab in the file browser. Without this,
+# only external storage (USB) is shown. Firmware often omits this bit
+# even when :6000/FTPS lists emmc; browsing internal memory may still
+# be slow or unreliable (e.g. on P2S) — enable only if you need the tab.
+
+patch_mqtt_internal_storage = 0
+
+# Filter the "MQTT verification failure" error so the slicer does not show it.
+# This fork ships the filter enabled (upstream default is 0, opt-in).
+filter_mqtt_hms_65543 = 1
+
+
+# --- EXPERIMENT: numeric sequence_id (opt-in) -------------------------
+#
+# !!! EXPERIMENTAL opt-in — leave this at 0 for normal use. !!!
+#
+# The key is `exp_numeric_sequence_id` (default 0).
+#
+# 0: the plugin emits `sequence_id` as a JSON string on the frames it
+#   builds AND signs itself — the `project_file` print command and the
+#   liveview prepare / rescue re-publishes — which is byte-identical to
+#   stock behaviour.
+# 1: the same value is emitted as a JSON number on exactly those frames,
+#   for the numeric-`sequence_id` investigation documented in
+#   research/06.02-mqtt.md.
+#
+# Nothing else changes: security.* frames, the pushall constant and
+# Studio-authored frames keep their existing form.
+
+exp_numeric_sequence_id = 0
+
+
+# --- Cloud ----------------------------------------------------------
+#
+# Everything below talks to Bambu Lab's online services (login, status,
+# print history, and sending a print through the cloud). Change these
+# only if you understand the trade-offs for privacy and reliability.
+#
+# !!! WARNING !!!
+#
+# Full cloud operation with a secured printer needs the slicer
+# certificate material (slicer_cert_pem / slicer_key_pem /
+# slicer_crl_pem; see below). The MQTT/HTTP cert_id is derived from
+# the leaf of slicer_cert.pem. Since v0.2.24 the plugin fetches this
+# material itself via bambu_network_update_cert - the same endpoint
+# Bambu's own plugin uses - and refreshes it whenever Bambu rotates
+# the certificate; set the paths below only to override it with your
+# own copies. The embedded bootstrap values the automatic fetch needs
+# and their recovery procedure are documented in src/appcert_cipher.cpp.
+# You alone are responsible for ensuring that your use of this
+# material complies with applicable terms and law.
+
+# Fully blocks talking to Bambu's cloud (live status, subscriptions,
+# cloud printing / uploading print files), except login, syncing
+# presets, and binding/unbinding a printer, which still work.
+# If you want cloud printing or any of the cloud_print modes below,
+# set this to 0 first.
+
+block_cloud = 1
+
+# Path to the app certificate chain (PEM) sent to the printer via the
+# security.app_cert_install MQTT command (new authorization-control system).
+# MQTT header.cert_id and HTTP x-bbl-app-certification-id are derived from
+# the leaf of this chain. If empty, looks for slicer_cert.pem in this
+# config directory.
+
+slicer_cert_pem =
+# Path to the slicer RSA private key (PEM) used for MQTT payload signing
+# and cloud REST request authentication.
+# If empty, looks for slicer_key.pem in this config directory.
+
+slicer_key_pem =
+
+
+# Path to the app certificate revocation list (PEM CRL) sent alongside the
+# app certificate in security.app_cert_install.
+# If empty, looks for slicer_crl.pem in this config directory.
+
+slicer_crl_pem =
+
+# Name this plugin sends as the client identity on cloud API calls.
+# POST /v1/user-service/my/task (cloud print / print history record) and
+# the /user/ttcode camera mint only accept the official slicer name
+# "BambuStudio" and answer HTTP 403 for any other value, which breaks
+# both (research/06.06-cloud-rest.md, reproduced 2026-10-07 on the CN
+# cloud with an H2D). The default therefore has to be BambuStudio.
+
+client_name = BambuStudio
+
+# Value sent as X-BBL-Executable-info on cloud API calls. Bambu's cloud
+# checks these contents against the attestation of a known Studio build
+# and answers 403 when they do not match, which breaks cloud live view
+# on H2 printers (they require proof-of-possession on the ttcode mint).
+# Leave empty for the built-in copy of BambuStudio's attestation; fill it
+# in only when Bambu has rotated the attestation and the built-in value
+# stopped being accepted.
+
+executable_info = 
+
+# Attach proof-of-possession headers (x-bbl-app-certification-id +
+# x-bbl-device-security-sign) to POST /v1/user-service/my/task, the call
+# that registers a cloud print with MakerWorld.
+#
+#   auto  Default. Attach the pair on the CN cloud (api.bambulab.cn),
+#         where the bearer-only request answers 403, and keep the
+#         historical bearer-only request elsewhere (api.bambulab.com
+#         accepts it). Same as leaving this key out.
+#   1     Force the pair on for any region. Try this when cloud print
+#         fails with HTTP 403 on /my/task while client_name is already
+#         "BambuStudio" and every other API answers 200, and research/
+#         10.05 lists /my/task as proof-of-possession-required on a
+#         verified printer.
+#   0     Force the pair off, including on the CN cloud.
+#
+# No slicer key/cert present means no headers are sent, so `auto` is safe
+# on accounts without signing material.
+
+mytask_pop = auto
+
+# How a print is sent when the slicer wants to use the cloud / "print
+# with record" path (typical for a printer that is linked to your
+# Bambu account). This does not change pure LAN-only printers.
+#
+#   cloud_only     — Default. The slicer first tries to put the model on
+#                    the printer over your local network (LAN). If that
+#                    fails, the full model is uploaded to the cloud instead.
+#                    Either way the cloud is required for print history /
+#                    reporting and to start the job — without a working
+#                    cloud connection, printing will not work.
+#
+#   try_lan_first  — Prefer a fully private local send (same as when the
+#                    printer is in LAN-only mode): put the file on the
+#                    printer over your home/LAN network and start the print
+#                    there, without uploading the full model to Bambu. If
+#                    that fails (printer offline on LAN, wrong access code,
+#                    upload error, …), the slicer is allowed to fall back
+#                    to a normal cloud print (full model uploaded to Bambu).
+#
+#   lan_only       — Fully analogous to the printer being in LAN-only mode:
+#                    always send and start the print locally. Never fall
+#                    back to uploading the full model to the cloud. If the
+#                    local send fails, the print simply fails.
+
+cloud_print = cloud_only
+
+# Hide cloud print history on the Bambu Studio home page (return an
+# empty task list). Useful with true LAN print modes (try_lan_first /
+# lan_only above), which do not write a cloud history entry — otherwise
+# the home page still shows older cloud jobs and looks inconsistent.
+
+cloud_hide_history = 0
+
+# Server addresses (Global region — used when country is not China).
+
+cloud_global_api_host = https://api.bambulab.com
+cloud_global_web_host = https://bambulab.com
+cloud_global_mqtt_host = us.mqtt.bambulab.com
+
+# Server addresses (China region).
+
+cloud_cn_api_host = https://api.bambulab.cn
+cloud_cn_web_host = https://bambulab.cn
+cloud_cn_mqtt_host = cn.mqtt.bambulab.com
+
+cloud_mqtt_port = 8883
