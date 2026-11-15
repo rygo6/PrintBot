@@ -39,7 +39,6 @@ using namespace nlohmann;
 
 namespace Slic3r {
 
-static const std::string VERSION_CHECK_URL = "";
 static const std::string MODELS_STR = "models";
 
 const std::string AppConfig::SECTION_FILAMENTS = "filaments";
@@ -1501,12 +1500,6 @@ std::string AppConfig::config_path(EAppMode mode)
 #endif
 
     return path;
-}
-
-std::string AppConfig::version_check_url() const
-{
-    auto from_settings = get("version_check_url");
-    return from_settings.empty() ? VERSION_CHECK_URL : from_settings;
 }
 
 bool AppConfig::exists()

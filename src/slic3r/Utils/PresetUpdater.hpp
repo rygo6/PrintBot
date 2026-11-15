@@ -57,14 +57,12 @@ public:
 	void on_update_notification_confirm();
     void do_printer_config_update();
 
-	bool version_check_enabled() const;
 
 private:
 	struct priv;
 	std::unique_ptr<priv> p;
 };
 
-wxDECLARE_EVENT(EVT_SLIC3R_EXPERIMENTAL_VERSION_ONLINE, wxCommandEvent);
 
 
 }

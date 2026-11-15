@@ -38,7 +38,46 @@
 
 #include "slic3r/GUI/Plater.hpp"
 
+#include "core/EventBus.hpp"
+#include "core/SliceEvents.hpp"
+
 namespace Slic3r {
+
+// print_bot: milestones go out on the core event bus (Topic::Slice); the Plater adapter turns them
+// back into its wx events on the UI thread.
+void BackgroundSlicingProcess::publish_slicing_completed(int timestamp)
+{
+	namespace ce = printbot::core;
+	if (m_events)
+		m_events->publish(ce::Topic::Slice, ce::slice_events::kSlicingCompleted, {{"timestamp", timestamp}},
+			ce::slice_events::SlicingCompleted{timestamp});
+}
+
+void BackgroundSlicingProcess::publish_process_completed(int status, std::exception_ptr exception)
+{
+	namespace ce = printbot::core;
+	if (!m_events)
+		return;
+	ce::slice_events::ProcessCompleted pc;
+	pc.status    = ce::slice_events::ProcessCompleted::Status(status);
+	pc.exception = exception;
+	static const char *names[] = {"finished", "cancelled", "error"};
+	m_events->publish(ce::Topic::Slice, ce::slice_events::kProcessCompleted, {{"status", names[status]}}, pc);
+}
+
+void BackgroundSlicingProcess::publish_export_began()
+{
+	namespace ce = printbot::core;
+	if (m_events)
+		m_events->publish(ce::Topic::Slice, ce::slice_events::kExportBegan);
+}
+
+void BackgroundSlicingProcess::publish_export_finished(const std::string &path)
+{
+	namespace ce = printbot::core;
+	if (m_events)
+		m_events->publish(ce::Topic::Slice, ce::slice_events::kExportFinished, {{"path", path}}, ce::slice_events::ExportFinished{path});
+}
 
 bool SlicingProcessCompletedEvent::critical_error() const
 {
@@ -207,11 +246,9 @@ void BackgroundSlicingProcess::process_fff()
 	if (m_print->finished()) {
 		BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: skip slicing, to process previous gcode file")%__LINE__;
 		m_fff_print->set_status(80, _utf8(L("Processing G-Code from Previous file...")));
-		wxCommandEvent evt(m_event_slicing_completed_id);
 		// Post the Slicing Finished message for the G-code viewer to update.
 		// Passing the timestamp
-		evt.SetInt((int)(m_fff_print->step_state_with_timestamp(PrintStep::psSlicingFinished).timestamp));
-		wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
+		publish_slicing_completed((int)(m_fff_print->step_state_with_timestamp(PrintStep::psSlicingFinished).timestamp));
 
 		m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
 		if (! m_export_path.empty()) {
@@ -239,11 +276,9 @@ void BackgroundSlicingProcess::process_fff()
             std::vector<int> f_nozzle_maps = m_fff_print->get_filament_nozzle_maps();
             m_current_plate->set_filament_nozzle_maps(f_nozzle_maps);
 		}
-		wxCommandEvent evt(m_event_slicing_completed_id);
 		// Post the Slicing Finished message for the G-code viewer to update.
 		// Passing the timestamp
-		evt.SetInt((int)(m_fff_print->step_state_with_timestamp(PrintStep::psSlicingFinished).timestamp));
-		wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
+		publish_slicing_completed((int)(m_fff_print->step_state_with_timestamp(PrintStep::psSlicingFinished).timestamp));
 
 		//BBS: add plate index into render params
 		m_temp_output_path = this->get_current_plate()->get_tmp_gcode_path();
@@ -253,7 +288,7 @@ void BackgroundSlicingProcess::process_fff()
 	}
 	if (this->set_step_started(bspsGCodeFinalize)) {
 	    if (! m_export_path.empty()) {
-			wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new wxCommandEvent(m_event_export_began_id));
+			publish_export_began();
 			export_gcode();
 	    } else {
 			m_print->set_status(100, _utf8(L("Slicing complete")));
@@ -279,7 +314,7 @@ void BackgroundSlicingProcess::process_sla()
     m_print->process();
     if (this->set_step_started(bspsGCodeFinalize)) {
         if (! m_export_path.empty()) {
-			wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, new wxCommandEvent(m_event_export_began_id));
+			publish_export_began();
 
             const std::string export_path = m_sla_print->print_statistics().finalize_output_path(m_export_path);
 
@@ -354,11 +389,10 @@ void BackgroundSlicingProcess::thread_proc()
 		if (m_print->cancel_status() != Print::CANCELED_INTERNAL) {
 			// Only post the canceled event, if canceled by user.
 			// Don't post the canceled event, if canceled from Print::apply().
-			SlicingProcessCompletedEvent evt(m_event_finished_id, 0,
-				(m_state == STATE_CANCELED) ? SlicingProcessCompletedEvent::Cancelled :
-				exception ? SlicingProcessCompletedEvent::Error : SlicingProcessCompletedEvent::Finished, exception);
-			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": send SlicingProcessCompletedEvent to main, status %1%")%evt.status();
-			wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
+			const int status = (m_state == STATE_CANCELED) ? SlicingProcessCompletedEvent::Cancelled :
+				exception ? SlicingProcessCompletedEvent::Error : SlicingProcessCompletedEvent::Finished;
+			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": publish process completed, status %1%")%status;
+			publish_process_completed(status, exception);
 		}
 		else {
 			//BBS: internal cancel
@@ -581,9 +615,7 @@ bool BackgroundSlicingProcess::stop()
 			m_print->restart();
 			m_print->set_cancel_callback([](){});
 			// Notify UI that slicing was canceled so it can clean up (hide progress bar, etc.)
-			SlicingProcessCompletedEvent evt(m_event_finished_id, 0,
-				SlicingProcessCompletedEvent::Cancelled, std::exception_ptr());
-			wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt.Clone());
+			publish_process_completed(SlicingProcessCompletedEvent::Cancelled, std::exception_ptr());
 			BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", exit (force-canceled, thread orphaned)" << std::endl;
 			return true;
 		}
@@ -908,10 +940,7 @@ void BackgroundSlicingProcess::export_gcode()
 	}
 
 	// BBS
-	auto evt = new wxCommandEvent(m_event_export_finished_id, GUI::wxGetApp().mainframe->m_plater->GetId());
-	wxString output_gcode_str = wxString::FromUTF8(export_path.c_str(), export_path.length());
-	evt->SetString(output_gcode_str);
-	wxQueueEvent(GUI::wxGetApp().mainframe->m_plater, evt);
+	publish_export_finished(export_path);
 
 	// BBS: to be checked. Whether use export_path or output_path.
 	gcode_add_line_number(export_path, m_fff_print->full_print_config());

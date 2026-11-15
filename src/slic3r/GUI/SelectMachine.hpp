@@ -1,6 +1,8 @@
 #ifndef slic3r_GUI_SelectMachine_hpp_
 #define slic3r_GUI_SelectMachine_hpp_
 
+#include <chrono>
+#include <functional>
 #include <wx/wx.h>
 #include <wx/intl.h>
 #include <wx/collpane.h>
@@ -584,7 +586,29 @@ public:
     Plater* get_plater() const { return m_plater; }
     MachineObject* get_current_machine() const;
 
+    // print_bot MCP: read-only views for the print approval summary and send tracking.
+    std::shared_ptr<PrintJob> mcp_print_job() const { return m_print_job; }
+    int  mcp_print_plate_idx() const { return m_print_plate_idx; }
+    bool mcp_is_sending() const { return m_is_in_sending_mode; }
+    std::map<std::string, std::string> mcp_print_options() const
+    {
+        std::map<std::string, std::string> out;
+        for (const auto &[key, opt] : m_checkbox_list)
+            if (opt && opt->IsShown()) out[key] = opt->getValue();
+        return out;
+    }
+    // print_bot MCP: one-shot check run immediately before the print job starts (after any warnings
+    // the user answers). Returning false aborts the send. Consumed by the first send attempt.
+    void mcp_arm_final_check(std::function<bool(std::string &)> check, std::chrono::steady_clock::time_point expires)
+    {
+        m_mcp_final_check   = std::move(check);
+        m_mcp_final_expires = expires;
+    }
+    void mcp_disarm_final_check() { m_mcp_final_check = nullptr; }
+
 private:
+    std::function<bool(std::string &)>    m_mcp_final_check;
+    std::chrono::steady_clock::time_point m_mcp_final_expires;
     void EnableEditing(bool enable);
 
     // printing

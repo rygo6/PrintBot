@@ -2765,11 +2765,6 @@ void NotificationManager::bbl_show_slice_emptylayer_notification(const std::stri
     push_notification_data(std::move(notification), 0);
 }
 
-void NotificationManager::bbl_show_app_newversion_notification()
-{
-	push_notification(NotificationType::NewAppAvailable);
-}
-
 void NotificationManager::bbl_show_need_support_on_notification()
 {
     NotificationData data{NotificationType::BBLNeedSupportON, NotificationLevel::WarningNotificationLevel, 0,_u8L("Warning:") + "\n" + _u8L("Your model needs support ! Please make support material enable.")};

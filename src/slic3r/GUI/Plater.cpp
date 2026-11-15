@@ -191,6 +191,8 @@
 #include "DeviceCore/DevDefs.h"
 #include "DeviceCore/DevConfigUtil.h"
 #include "ImageMessageDialog.hpp"
+#include "core/Core.hpp"
+#include "core/SliceEvents.hpp"
 
 
 using boost::optional;
@@ -4799,7 +4801,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
     wxGetApp().app_config ->set("ams_filament_ids", p->ams_list_device, ams_filament_ids);
     if (!unknowns.empty()) {
         MessageDialog dlg(this,
-            _L("There are some unknown or uncompatible filaments mapped to generic preset.\nPlease update Bambu Studio or restart Bambu Studio to check if there is an update to system presets.") + detail,
+            _L("There are some unknown or uncompatible filaments mapped to generic preset.\nPlease check that the matching system presets are installed.") + detail,
             _L("Sync filaments with AMS"), wxOK);
         dlg.ShowModal();
     }
@@ -6705,6 +6707,9 @@ public:
     ProjectDirtyStateManager dirty_state;
 
     BackgroundSlicingProcess    background_process;
+    // print_bot: slicing milestones arrive from the core event bus (published by background_process);
+    // declared after it so it unsubscribes first on destruction.
+    printbot::core::Subscription core_slice_events;
     bool suppressed_backround_processing_update { false };
     // UIThreadWorker can be used as a replacement for BoostThreadWorker if
     // no additional worker threads are desired (useful for debugging or profiling)
@@ -7150,6 +7155,8 @@ public:
     void track_slice_mesh_stat();
     void on_export_began(wxCommandEvent&);
     void on_export_finished(wxCommandEvent&);
+    // print_bot: adapter from core slice events (Topic::Slice) back to the Plater's wx events.
+    void on_core_slice_event(const printbot::core::Event &ev);
     void on_slicing_began();
 
 
@@ -7438,10 +7445,12 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
 
     // BBS: to be checked. Not follow patch.
     background_process.set_thumbnail_cb([this](const ThumbnailsParams& params) { return this->generate_thumbnails(params, Camera::EType::Ortho); });
-    background_process.set_slicing_completed_event(EVT_SLICING_COMPLETED);
-    background_process.set_finished_event(EVT_PROCESS_COMPLETED);
-    background_process.set_export_began_event(EVT_EXPORT_BEGAN);
-    background_process.set_export_finished_event(EVT_EXPORT_FINISHED);
+    // print_bot: the background process publishes its milestones on the core event bus; deliver them on the
+    // UI thread through the Plater's CallAfter queue (same queue and order as the former wxQueueEvent posts).
+    background_process.set_event_bus(&wxGetApp().core().events());
+    core_slice_events = wxGetApp().core().events().subscribe(
+        {printbot::core::Topic::Slice}, [this](const printbot::core::Event &ev) { on_core_slice_event(ev); },
+        [q = this->q](printbot::core::Task task) { q->CallAfter(std::move(task)); });
     this->q->Bind(EVT_SLICING_UPDATE, &priv::on_slicing_update, this);
     this->q->Bind(EVT_REPAIR_MODEL, &priv::on_repair_model, this);
     this->q->Bind(EVT_FILAMENT_COLOR_CHANGED, &priv::on_filament_color_changed, this);
@@ -8589,8 +8598,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         // select plate 0 as default
                         //q->select_plate(0);
                         if (load_type != LoadType::LoadGeometry) {
+                            // print_bot: no "update the app" prompt, just say what was loaded.
                             if (en_3mf_file_type == En3mfType::From_BBS)
-                                show_info(q, _L("Due to the lower version of Bambu Studio, this 3mf file cannot be fully loaded. Please update Bambu Studio to the latest version"), _L("Load 3mf"));
+                                q->get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                                    NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                    into_u8(wxString::Format(_L("This 3mf was saved by a newer slicer (%s); its settings could not be loaded, only the geometry."),
+                                                             from_u8(file_version.to_string()))));
                             else
                                 q->get_notification_manager()->push_notification(NotificationType::CustomNotification,
                                     NotificationManager::NotificationLevel::WarningNotificationLevel,
@@ -8603,42 +8616,19 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         //}
                     }
                     else if (load_config && (file_version > app_version)) {
-                        Semver cloud_ver;
-                        if (wxGetApp().app_config->has("app", "cloud_version")) {
-                            std::string cloud_version = wxGetApp().app_config->get("app", "cloud_version");
-                            if (!cloud_version.empty())
-                                cloud_ver                 = *(Semver::parse(cloud_version));
-                            else
-                                cloud_ver = app_version;
-                        } else {
-                            cloud_ver = app_version;
-                        }
-                        int file_version_cc = file_version.patch()/100;
-                        int app_version_cc = app_version.patch()/100;
-
-                        if ((file_version.min() != app_version.min()) || (file_version_cc != app_version_cc)) {
-                            if (config_substitutions.unrecogized_keys.size() > 0) {
-                                // std::string context = into_u8(text);
-                                wxString context;
-                                if (wxGetApp().app_config->get("user_mode") == "develop") {
-                                    context = _L("Found following keys unrecognized:\n");
-                                    for (auto& key : config_substitutions.unrecogized_keys) {
-                                        context += "  -";
-                                        context += key;
-                                        context += ";\n";
-                                    }
-                                }
-                                context += "\n\n";
-                                Newer3mfVersionDialog newer_dlg(q, &file_version, &cloud_ver, context);
-                                newer_dlg.ShowModal();
+                        // print_bot: a 3mf from a newer Bambu Studio loads normally. There is no "update the app" dialog;
+                        // only mention settings that this version does not know (they are ignored).
+                        BOOST_LOG_TRIVIAL(info) << "load_files: 3mf from newer version " << file_version.to_string() << ", app " << app_version.to_string()
+                                                << ", unrecognized keys " << config_substitutions.unrecogized_keys.size();
+                        if (!config_substitutions.unrecogized_keys.empty() && load_type != LoadType::LoadGeometry) {
+                            wxString text = wxString::Format(_L("This 3mf was saved by a newer slicer (%s). %d settings it uses are not known to this version and were ignored."),
+                                                             from_u8(file_version.to_string()), int(config_substitutions.unrecogized_keys.size()));
+                            if (wxGetApp().app_config->get("user_mode") == "develop") {
+                                text += "\n";
+                                for (auto &key : config_substitutions.unrecogized_keys) text += "  -" + from_u8(key) + "\n";
                             }
-                            else {
-                                //if the minor version is not matched
-                                //if (file_version.min() != app_version.min()) {
-                                Newer3mfVersionDialog newer_dlg(q, &file_version, &cloud_ver, "");
-                                    auto res = newer_dlg.ShowModal();
-                                //}
-                            }
+                            q->get_notification_manager()->push_notification(NotificationType::CustomNotification,
+                                NotificationManager::NotificationLevel::RegularNotificationLevel, into_u8(text));
                         }
                     }
                     else if (load_config && config_loaded.empty()) {
@@ -12810,6 +12800,31 @@ void Plater::priv::on_export_began(wxCommandEvent& evt)
 {
     if (show_warning_dialog)
         warnings_dialog();
+}
+
+void Plater::priv::on_core_slice_event(const printbot::core::Event &ev)
+{
+    namespace se = printbot::core::slice_events;
+    if (ev.key == se::kSlicingCompleted) {
+        wxCommandEvent evt(EVT_SLICING_COMPLETED);
+        if (auto *p = ev.payload_as<se::SlicingCompleted>())
+            evt.SetInt(p->timestamp);
+        q->ProcessWindowEvent(evt);
+    } else if (ev.key == se::kProcessCompleted) {
+        auto *p = ev.payload_as<se::ProcessCompleted>();
+        if (!p)
+            return;
+        SlicingProcessCompletedEvent evt(EVT_PROCESS_COMPLETED, 0, SlicingProcessCompletedEvent::StatusType(p->status), p->exception);
+        q->ProcessWindowEvent(evt);
+    } else if (ev.key == se::kExportBegan) {
+        wxCommandEvent evt(EVT_EXPORT_BEGAN);
+        q->ProcessWindowEvent(evt);
+    } else if (ev.key == se::kExportFinished) {
+        wxCommandEvent evt(EVT_EXPORT_FINISHED, q->GetId());
+        if (auto *p = ev.payload_as<se::ExportFinished>())
+            evt.SetString(wxString::FromUTF8(p->path.c_str(), p->path.length()));
+        q->ProcessWindowEvent(evt);
+    }
 }
 
 void Plater::priv::on_export_finished(wxCommandEvent& evt)
@@ -17750,6 +17765,27 @@ int Plater::load_project(wxString const &filename2,
 }
 
 // BBS: save logic
+// print_bot (MCP)
+int Plater::save_project_to(const wxString &filename)
+{
+    if (filename.empty())
+        return wxID_CANCEL;
+    if (auto *assemble_canvas = get_assmeble_canvas3D())
+        assemble_canvas->prepare_assembly_steps_for_project_save();
+    auto save_strategy = SaveStrategy::SplitModel | SaveStrategy::ShareMesh;
+    if (wxGetApp().app_config->get_bool("export_sources_full_pathnames"))
+        save_strategy = save_strategy | SaveStrategy::FullPathSources;
+    if (export_3mf(into_path(filename), save_strategy) < 0)
+        return wxID_CANCEL;
+    Slic3r::remove_backup(model(), false);
+    p->set_project_filename(filename);
+    up_to_date(true, false);
+    up_to_date(true, true);
+    wxGetApp().update_saved_preset_from_current_preset();
+    reset_project_dirty_after_save();
+    return wxID_YES;
+}
+
 int Plater::save_project(bool saveAs)
 {
     //if (up_to_date(false, false)) // should we always save
@@ -19488,6 +19524,50 @@ void Plater::export_gcode(bool prefer_removable)
         } catch (...) {}
 
     }
+}
+
+// print_bot (MCP)
+int Plater::slice_error_plate() const { return p->process_completed_with_error; }
+
+bool Plater::cancel_slicing()
+{
+    if (p->background_process.idle()) return false;
+    p->background_process.stop();
+    return true;
+}
+
+// print_bot (MCP)
+bool Plater::export_gcode_to(const std::string &path, std::string &error)
+{
+    if (p->model.objects.empty()) {
+        error = "the plate is empty";
+        return false;
+    }
+    if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index()) {
+        error = "the current plate has slicing errors";
+        return false;
+    }
+    if (p->background_process.is_export_scheduled()) {
+        error = "another export is running";
+        return false;
+    }
+    try {
+        unsigned int state = p->update_restart_background_process(false, false);
+        if (state & priv::UPDATE_BACKGROUND_PROCESS_INVALID) {
+            error = "the current configuration or plate is invalid (see the notifications in the app)";
+            return false;
+        }
+    } catch (const std::exception &ex) {
+        error = ex.what();
+        return false;
+    }
+    fs::path output_path(path);
+    p->notification_manager->new_export_began(false);
+    p->exporting_status     = ExportingStatus::EXPORTING_TO_LOCAL;
+    p->last_output_path     = output_path.string();
+    p->last_output_dir_path = output_path.parent_path().string();
+    p->export_gcode(output_path, false);
+    return true;
 }
 
 void Plater::send_to_printer(bool isall)

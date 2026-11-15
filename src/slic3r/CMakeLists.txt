@@ -232,6 +232,11 @@ set(SLIC3R_GUI_SOURCES
     GUI/BedShapeDialog.hpp
     GUI/Plater.cpp
     GUI/Plater.hpp
+    GUI/PrintBotMcp.cpp
+    GUI/PrintBotMcp.hpp
+    GUI/PrintBotMcpTools.cpp
+    GUI/PrintBotApproval.cpp
+    GUI/PrintBotApproval.hpp
     GUI/PartPlate.cpp
     GUI/PartPlate.hpp
     GUI/WipeTowerPlacement.cpp
@@ -622,7 +627,7 @@ else ()
     find_library(HPDF_LIBRARY NAMES hpdf hpdfd HINTS lib REQUIRED)
 endif ()
 
-target_link_libraries(libslic3r_gui libslic3r cereal imgui imguizmo GLEW::GLEW OpenGL::GL hidapi
+target_link_libraries(libslic3r_gui libslic3r printbot_core printbot_mcp cereal imgui imguizmo GLEW::GLEW OpenGL::GL hidapi
     ${HPDF_LIBRARY}
     ${wxWidgets_LIBRARIES} glfw libcurl OpenSSL::SSL OpenSSL::Crypto)
 #target_link_libraries(libslic3r_gui libslic3r cereal imgui imguizmo GLEW::GLEW OpenGL::GL hidapi libcurl OpenSSL::SSL OpenSSL::Crypto ${wxWidgets_LIBRARIES} glfw)

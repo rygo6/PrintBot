@@ -3102,6 +3102,24 @@ void GLCanvas3D::render(bool only_init)
         m_assembly_steps->process_assembly_pdf_capture();
     }
 
+    if (m_frame_capture) {
+        // print_bot: frame readback for the MCP ui_screenshot tool.
+        auto fn         = std::move(m_frame_capture);
+        m_frame_capture   = nullptr;
+        const Size &cs    = get_canvas_size();
+        const int   w = std::max(1, cs.get_width()), h = std::max(1, cs.get_height());
+        std::vector<unsigned char> px(size_t(w) * size_t(h) * 4);
+        glsafe(::glBindFramebuffer(GL_FRAMEBUFFER, 0));
+        glsafe(::glPixelStorei(GL_PACK_ALIGNMENT, 1));
+        glsafe(::glReadBuffer(GL_BACK));
+        glsafe(::glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data()));
+        std::vector<unsigned char> flipped(px.size());
+        const size_t row = size_t(w) * 4;
+        for (int y = 0; y < h; ++y)
+            std::memcpy(flipped.data() + size_t(y) * row, px.data() + size_t(h - 1 - y) * row, row);
+        fn(w, h, std::move(flipped));
+    }
+
     ogl_manager.unbind_vao();
     ogl_manager.clear_dirty();
     m_canvas->SwapBuffers();

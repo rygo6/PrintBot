@@ -354,6 +354,16 @@ public:
     // BBS: save & backup
     int load_project(wxString const & filename = "", wxString const & originfile = "-");
     int save_project(bool saveAs = false);
+    // print_bot (MCP): save the project to a given .3mf path without dialogs (same steps as save_project).
+    // Returns wxID_YES on success, wxID_CANCEL on failure.
+    int save_project_to(const wxString &filename);
+    // print_bot (MCP): export the current plate's G-code to a path without the file dialog
+    // (slices first if needed; finishes asynchronously like the Export button). False + reason on refusal.
+    bool export_gcode_to(const std::string &path, std::string &error);
+    // print_bot (MCP): index of the plate whose last slice failed, or -1.
+    int slice_error_plate() const;
+    // print_bot MCP: stop background slicing like the notification's Cancel button. Returns false if idle.
+    bool cancel_slicing();
     //BBS download project by project id
     // BBS: check snapshot
     bool up_to_date(bool saved, bool backup);

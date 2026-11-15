@@ -42,6 +42,11 @@ find_package(libnoise REQUIRED)
 
 add_subdirectory(libslic3r)
 
+# print_bot: GUI-free core + headless MCP server (must stay before the wx setup below,
+# so no wxWidgets include dirs/flags leak into them).
+add_subdirectory(core)
+add_subdirectory(mcp)
+
 if (SLIC3R_GUI)
     add_subdirectory(imgui)
     add_subdirectory(imguizmo)
@@ -154,6 +159,8 @@ if (NOT WIN32 AND NOT APPLE)
 endif ()
 
 target_link_libraries(BambuStudio libslic3r cereal)
+# Building the app also builds the headless MCP server.
+add_dependencies(BambuStudio print_bot_mcp)
 if (APPLE)
 #    add_compile_options(-stdlib=libc++)
 #    add_definitions(-DBOOST_THREAD_DONT_USE_CHRONO -DBOOST_NO_CXX11_RVALUE_REFERENCES -DBOOST_THREAD_USES_MOVE)

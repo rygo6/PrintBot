@@ -56,6 +56,8 @@ class wxGLCanvas;
 class Notebook;
 struct wxLanguageInfo;
 
+namespace printbot { namespace core { class Core; } }
+
 namespace Slic3r {
 
 class AppConfig;
@@ -310,6 +312,8 @@ private:
     std::unique_ptr<RemovableDriveManager> m_removable_drive_manager;
 
     std::unique_ptr<ImGuiWrapper> m_imgui;
+    // print_bot: GUI-free core (phase 1: event bus + executor on the wx main loop).
+    std::unique_ptr<printbot::core::Core> m_core;
 	std::unique_ptr <OtherInstanceMessageHandler> m_other_instance_message_handler;
     std::unique_ptr <wxSingleInstanceChecker> m_single_instance_checker;
     std::string m_instance_hash_string;
@@ -605,6 +609,8 @@ public:
     AppConfig*      app_config{ nullptr };
     PresetBundle*   preset_bundle{ nullptr };
     PresetUpdater*  preset_updater{ nullptr };
+    // print_bot: the app core (created on first use, embedded mode).
+    printbot::core::Core& core();
     MainFrame*      mainframe{ nullptr };
     Plater*         plater_{ nullptr };
 

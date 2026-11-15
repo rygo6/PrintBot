@@ -1,5 +1,7 @@
 #include "libslic3r/Technologies.hpp"
 #include "GUI_App.hpp"
+#include "core/Core.hpp"
+#include "PrintBotMcp.hpp"
 #include "HomePanel.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
@@ -1761,6 +1763,24 @@ void GUI_App::init_networking_callbacks()
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": exit, m_agent=%1%")%m_agent;
 }
 
+printbot::core::Core& GUI_App::core()
+{
+    if (!m_core) {
+        printbot::core::CoreOptions opts;
+        opts.mode            = printbot::core::CoreOptions::Mode::Embedded;
+        opts.host_dispatcher = [](printbot::core::Task task) {
+            if (wxTheApp)
+                wxTheApp->CallAfter(std::move(task));
+        };
+        opts.host_is_current = []() { return wxThread::IsMain(); };
+        auto created = printbot::core::Core::create(std::move(opts));
+        if (!created)
+            throw Slic3r::RuntimeError("print_bot core init failed: " + created.error().message);
+        m_core = std::move(created.value());
+    }
+    return *m_core;
+}
+
 GUI_App::~GUI_App()
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": enter");
@@ -2209,6 +2229,8 @@ bool GUI_App::OnInit()
 
 int GUI_App::OnExit()
 {
+    // print_bot: stop accepting MCP clients first; pending tool calls get "app.exiting".
+    pbmcp::stop_host();
 #ifdef __APPLE__
     UnRegisterMacPowerCallBack();
 #endif
@@ -2778,6 +2800,8 @@ bool GUI_App::on_init_inner()
 #endif
     mainframe->Show(true);
     BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
+    // print_bot: live MCP endpoint (agents drive this window through print_bot-mcp); started from the event loop.
+    CallAfter([]() { pbmcp::start_host(); });
     perf_mark("Main window shown");
 
 //#if BBL_HAS_FIRST_PAGE
@@ -3786,19 +3810,10 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
         catch (...) {}
     }
 
-    // Version limit
-    if (code == HttpErrorVersionLimited) {
+    // print_bot: no "version too old, download the latest" prompt (cloud version limits do not apply).
+    if (status == 400 && code == HttpErrorCertRevoked) {
         if (!m_show_error_msgdlg) {
-            MessageDialog msg_dlg(nullptr, _L("The Bambu Studio version is too old to enable cloud service. Please download the latest version from Bambu Lab website."), "", wxAPPLY | wxOK);
-            m_show_error_msgdlg = true;
-            auto modal_result = msg_dlg.ShowModal();
-            m_show_error_msgdlg = false;
-            return;
-        }
-    }
-    else if (status == 400 && code == HttpErrorCertRevoked) {
-        if (!m_show_error_msgdlg) {
-            MessageDialog msg_dlg(nullptr, _L("Your software certificate has been revoked, please update Bambu Studio software."), "", wxAPPLY | wxOK);
+            MessageDialog msg_dlg(nullptr, _L("The software certificate has been revoked."), "", wxAPPLY | wxOK);
             m_show_error_msgdlg = true;
             auto modal_result = msg_dlg.ShowModal();
             m_show_error_msgdlg = false;
@@ -3858,32 +3873,15 @@ bool GUI_App::process_network_msg(std::string dev_id, std::string msg)
 
             return true;
         }
-        else if (msg == "update_studio") {
-            BOOST_LOG_TRIVIAL(info) << "process_network_msg, update_studio";
-            if (!m_show_error_msgdlg) {
-                MessageDialog msg_dlg(nullptr, _L("Please try updating Bambu Studio and then try again."), "", wxAPPLY | wxOK);
-                m_show_error_msgdlg = true;
-                auto modal_result = msg_dlg.ShowModal();
-                m_show_error_msgdlg = false;
-            }
-
-            return true;
-        }
-        else if (msg == "update_fixed_studio") {
-            BOOST_LOG_TRIVIAL(info) << "process_network_msg, update_fixed_studio";
-            if (!m_show_error_msgdlg) {
-                MessageDialog msg_dlg(nullptr, _L("Please try updating Bambu Studio and then try again."), "", wxAPPLY | wxOK);
-                m_show_error_msgdlg = true;
-                auto modal_result = msg_dlg.ShowModal();
-                m_show_error_msgdlg = false;
-            }
-
+        else if (msg == "update_studio" || msg == "update_fixed_studio") {
+            // print_bot: the network plugin asks for a newer Bambu Studio; there is nothing to install, so just log it.
+            BOOST_LOG_TRIVIAL(warning) << "process_network_msg, " << msg << " (ignored: no app updates in print_bot)";
             return true;
         }
         else if (msg == "cert_expired") {
             BOOST_LOG_TRIVIAL(info) << "process_network_msg, cert_expired";
             if (!m_show_error_msgdlg) {
-                MessageDialog msg_dlg(nullptr, _L("The certificate has expired. Please check the time settings or update Bambu Studio and try again."), "", wxAPPLY | wxOK);
+                MessageDialog msg_dlg(nullptr, _L("The certificate has expired. Please check the time settings and try again."), "", wxAPPLY | wxOK);
                 m_show_error_msgdlg = true;
                 auto modal_result = msg_dlg.ShowModal();
                 m_show_error_msgdlg = false;
@@ -3894,7 +3892,7 @@ bool GUI_App::process_network_msg(std::string dev_id, std::string msg)
         else if (msg == "cert_revoked") {
             BOOST_LOG_TRIVIAL(info) << "process_network_msg, cert_revoked";
             if (!m_show_error_msgdlg) {
-                MessageDialog msg_dlg(nullptr, _L("The certificate is no longer valid and the printing functions are unavailable. If you need printing. Please visit the official website at https://bambulab.com/ to download and update."), "", wxAPPLY | wxOK);
+                MessageDialog msg_dlg(nullptr, _L("The certificate is no longer valid and the printing functions are unavailable."), "", wxAPPLY | wxOK);
                 m_show_error_msgdlg = true;
                 auto modal_result = msg_dlg.ShowModal();
                 m_show_error_msgdlg = false;
@@ -3905,7 +3903,7 @@ bool GUI_App::process_network_msg(std::string dev_id, std::string msg)
         else if (msg == "update_firmware_studio") {
             BOOST_LOG_TRIVIAL(info) << "process_network_msg, firmware internal error";
             if (!m_show_error_msgdlg) {
-                MessageDialog msg_dlg(nullptr, _L("Internal error. Please try upgrading the firmware and Studio version. If the issue persists, contact customer support."), "", wxAPPLY | wxOK);
+                MessageDialog msg_dlg(nullptr, _L("Internal error. Please try upgrading the printer firmware. If the issue persists, contact customer support."), "", wxAPPLY | wxOK);
                 m_show_error_msgdlg = true;
                 auto modal_result = msg_dlg.ShowModal();
                 m_show_error_msgdlg = false;
@@ -3915,7 +3913,7 @@ bool GUI_App::process_network_msg(std::string dev_id, std::string msg)
         }
         else if (msg == "unsigned_studio") {
             BOOST_LOG_TRIVIAL(info) << "process_network_msg, unsigned_studio";
-            MessageDialog msg_dlg(nullptr, _L("Your software is not signed, and some printing functions have been restricted. Please use the officially signed software version."), "", wxAPPLY | wxOK);
+            MessageDialog msg_dlg(nullptr, _L("The printer restricted some printing functions for this unsigned software."), "", wxAPPLY | wxOK);
             m_show_error_msgdlg = true;
             auto modal_result = msg_dlg.ShowModal();
             m_show_error_msgdlg = false;

@@ -651,6 +651,7 @@ private:
     // when true renders an extra frame by not resetting m_dirty to false
     // see request_extra_frame()
     bool m_extra_frame_requested;
+    std::function<void(int, int, std::vector<unsigned char> &&)> m_frame_capture; // print_bot: see request_frame_capture()
     bool m_event_handlers_bound{ false };
 
 
@@ -1278,6 +1279,10 @@ public:
     void msw_rescale();
 
     void request_extra_frame() { m_extra_frame_requested = true; }
+    // print_bot: read back the next fully rendered frame (top-down RGBA rows, imgui overlays
+    // included) right before it is swapped to the screen. Used by the MCP ui_screenshot tool.
+    using FrameCaptureFn = std::function<void(int width, int height, std::vector<unsigned char> &&rgba)>;
+    void request_frame_capture(FrameCaptureFn fn) { m_frame_capture = std::move(fn); m_dirty = true; request_extra_frame(); }
 
     void schedule_extra_frame(int miliseconds);
 

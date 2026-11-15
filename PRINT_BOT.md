@@ -95,6 +95,139 @@ first.
 
     ./print_bot.sh
 
+## MCP server (live app + headless fallback)
+
+`build/src/print_bot-mcp` is the [MCP](https://modelcontextprotocol.io) entry point for agents
+(stdio, newline-delimited JSON-RPC 2.0; protocol 2025-06-18, 2025-03-26, 2024-11-05). It is built
+with the `BambuStudio` target (or alone: `cmake --build build --target print_bot-mcp`).
+
+**Live mode (default).** The running print_bot app hosts an MCP endpoint on a private Unix
+socket: `$PRINTBOT_MCP_SOCKET`, else `$XDG_RUNTIME_DIR/print_bot/mcp.sock`, else
+`/tmp/print_bot-<uid>/mcp.sock` (directory 0700, socket 0600, peer uid checked). `print_bot-mcp`
+connects to it and just relays bytes, so the agent drives the window the user is looking at.
+Every tool runs on the wx main thread through the same code paths as the user's clicks (preset
+combo boxes, settings tabs, the move/rotate/scale manipulation, toolbar events, tabs and
+dialogs), so the UI shows everything the agent does; each state-changing call also shows an
+"Agent: ..." notification on the canvas. If a modal dialog is waiting for an answer, calls
+return `ui.blocked_by_dialog` and the agent can inspect and answer it with the `ui_dialog_*`
+tools. Disable the endpoint with `PRINTBOT_MCP_DISABLE=1` or `mcp_server_enabled = false` in
+the app config.
+
+**Headless mode.** With no app running (or `--headless`) `print_bot-mcp` runs the wx-free core
+itself: presets, load models, slice and export only (17 tools), never a printer.
+
+    ./print_bot-mcp.sh [--headless | --gui] [--socket PATH] [--wait S] [--datadir DIR] [--tempdir DIR] [--log-level N]
+
+- `--gui`: require the running app (exit 1 if there is none) instead of falling back.
+- `--socket PATH`: endpoint to connect to (default as above). `--wait S`: wait up to S seconds
+  for the app to come up.
+- `--datadir` (headless): config dir with presets (default `$PRINTBOT_DATADIR`, else
+  `${XDG_CONFIG_HOME:-~/.config}/PrintBot`). Read-only use; use a separate dir to keep it
+  isolated from the GUI. `--resources`: the repo's `resources/` (the wrapper passes it).
+- stdout is protocol only; logs go to stderr.
+
+**Printer control is off by default.** Starting a print (`print_plate` with `dry_run = false`) and
+pausing/resuming/stopping (`printer_control`) are refused (`policy.denied`) unless the user starts
+the app with `PRINTBOT_MCP_ALLOW_PRINTER_CONTROL=1` or sets `mcp_allow_printer_control = true` in the
+app config. An agent may enable this only with explicit human authorization to enable MCP control.
+Enabling control is an additional requirement; it never approves a print.
+
+Before preparing every approval, run the sidebar Sync Info action (`ui_open_dialog` with
+`sync_info`) and complete Continue to sync filaments (`sync_filaments` can reopen that step). Verify
+actual presets and native feeder labels such as HT-A, then re-slice if synchronization changed
+settings. Opening a synchronization dialog alone is not success. The agent still presents the exact
+project/plate/objects/copies, destination printer, filament mapping, estimated time and material
+use, and asks before every print.
+
+**The human authorization gate.** Every MCP print goes through one gate (`print_plate`, nothing else):
+1. `print_plate {}` (dry run) returns the job summary and a `job_fingerprint` (SHA-256 over the
+   project, plate, object instances, G-code file, selected presets, full and plate settings, and
+   destination printer).
+2. `print_plate {dry_run: false, fingerprint}` requires printer control, refuses a changed job
+   (`approval.stale`), opens the Print dialog if needed, and freezes the job plus the dialog's actual
+   destination, filament mapping and options into an immutable approval fingerprint.
+3. print_bot shows its own native modal **Approve print** dialog with a read-only summary. Cancel is
+   the default, Approve is disabled for 1.5 s and needs a real mouse press or key press on the button.
+   The dialog is invisible to MCP: it is not listed or inspectable, and every MCP tool call returns
+   `approval.pending` while it is open. Print/Send dialog buttons and fields cannot be clicked or set
+   through MCP at all (`print.human_only`); `confirm` arguments are ignored.
+4. After approval the gate rechecks control policy and the full fingerprint, then presses Send.
+   The Print dialog runs the same check again immediately before the print job starts transport
+   (after any warnings the user answers). Any difference aborts with nothing sent. The approval is
+   single-use: it is consumed by the first send attempt, expires after 10 minutes, and every retry
+   or repeat needs a new dialog.
+5. Success returns `status: send_requested` (or a later observed state) and an `operation_id`, never
+   "sent". `get_print_operation` reports the transfer (`send_requested`, `awaiting_user_confirmation`,
+   `uploading`, `transferred`, `failed`, `not_sent`) and the printer's own report (`printing`, `paused`,
+   `finished`, `printer_failed`, `no_matching_job_reported`). Anything not observed stays `unknown`.
+   Never resend because an outcome is unknown.
+
+The headless server has no print routes and never sends. For tests, `PRINTBOT_MCP_TEST_NO_SEND=1`
+runs the whole gate but never presses Send.
+
+Robustness: malformed JSON-RPC (wrong types for `id`, `method`, `params`, tool name, `arguments`,
+`_meta`, progress tokens, bad batches, parse errors) gets a JSON-RPC error on the same connection;
+exceptions are caught at the session, request and tool-worker boundaries, so neither the headless
+bridge nor the GUI exits. `printer_camera_snapshot` runs ffmpeg directly with an argument vector
+(no shell), a timeout (`timeout_s`, default 20 s) and error messages that never include the stream
+URL or access code. `select_presets` is transactional: a failed selection restores the previous
+printer, process, filaments and bed, and any retained change publishes a new revision and marks
+slices outdated.
+
+Live tools (58):
+- General: `get_status`, `get_version`, `get_events`.
+- Presets: `list_printer_presets`, `list_process_presets`, `list_filament_presets`,
+  `get_selected_presets`, `select_presets` (printer, process, filament slots, bed type),
+  `get_preset_settings`, `set_preset_settings`, `save_preset` (user preset),
+  `discard_preset_changes`.
+- Project: `new_project`, `open_project` (3MF with its settings), `save_project`, `load_model`,
+  `undo`, `redo`.
+- Objects (addressed by id): `list_objects`, `remove_object`, `clear_project`, `select_objects`,
+  `transform_object` (position / move / rotate / scale / size), `set_object_settings`
+  (per-object overrides), `set_object_filament`, `rename_object`, `clone_object`,
+  `arrange_objects`, `orient_objects`.
+- Plates (numbered from 1): `list_plates`, `add_plate`, `delete_plate`, `select_plate`,
+  `set_plate_settings` (name, bed type, print sequence), `move_object_to_plate`.
+- Slicing / export: `slice` (plate or all; waits; progress notifications), `get_slice_status`,
+  `cancel_slice`, `export_gcode`, `export_sliced_file` (.gcode.3mf).
+- Printers: `list_printers` (LAN discovery), `get_printer_status` (state, temperatures, AMS,
+  HMS), `connect_printer` (access code), `disconnect_printer`, `printer_camera_snapshot`
+  (needs ffmpeg; `timeout_s`).
+- Print jobs (gated, see above): `print_plate` (dry run by default; `open_dialog` shows the
+  Print dialog without sending), `get_print_operation` (outcome of a send), `printer_control` (pause / resume / stop; dry run by default).
+- UI: `ui_get_state`, `ui_switch_tab`, `ui_set_camera`, `ui_screenshot` (canvas, window or
+  dialog to PNG; window/dialog capture is X11 only), `ui_list_dialogs`, `ui_dialog_inspect`,
+  `ui_dialog_click`, `ui_dialog_set`, `ui_close_dialog`, `ui_open_dialog`.
+
+Headless tools: `get_status`, `get_version`, `list_printer_presets`, `list_process_presets`,
+`list_filament_presets`, `get_selected_presets`, `select_presets`, `load_model`,
+`list_objects`, `remove_object`, `clear_project`, `arrange_objects`, `slice`,
+`get_slice_status`, `cancel_slice`, `export_gcode`, `get_events`.
+
+Agent skill: [`skills/printbot/SKILL.md`](skills/printbot/SKILL.md) teaches an LLM agent to use these tools (workflows, safety rules, error codes); [`skills/printbot/tools.md`](skills/printbot/tools.md) is the full parameter reference generated from the schemas.
+
+Register it with an MCP client (`mcp.json` / `.cursor/mcp.json` style; use the absolute path of
+your checkout):
+
+```json
+{
+  "mcpServers": {
+    "print_bot": {
+      "command": "/path/to/print_bot/print_bot-mcp.sh"
+    }
+  }
+}
+```
+
+Code layout: `src/core/` is the wx-free core (event bus, single core thread, snapshots,
+preset/project/slice services; the `printbot_no_gui_check` build step fails on any `wx/`,
+`slic3r/GUI/` or `slic3r/Utils/` include in `src/core` or `src/mcp`). `src/mcp/` holds the MCP
+protocol server, the headless tools and the socket transport (`McpSocket`). The live endpoint
+and its tools are in `src/slic3r/GUI/PrintBotMcp.cpp` (socket host, main-thread marshalling,
+agent notifications, policy) and `PrintBotMcpTools.cpp` (tools). The GUI uses the same event
+bus: `BackgroundSlicingProcess` publishes slice milestones on it and the Plater turns them back
+into its wx events via `CallAfter`.
+
 ### Home page "User Manual" section (deleted outright)
 The Home tab's left-menu "User Manual" entry and everything behind it are gone: the in-app wiki
 webview (`m_browserWiki`, `homepage3/wiki.html`, `js/wiki.js`, `css/wiki.css`), the
@@ -229,7 +362,7 @@ Kept but questionable (still compiled, not reachable or not testable here):
 
 ### t75u prune (round 2) + t84u dark-mode fix
 
-Kept on purpose (automation infrastructure for the planned embedded MCP server): the CLI in
+Kept on purpose (automation infrastructure for the MCP server): the CLI in
 `src/BambuStudio.cpp`, `xs/`, `t/`, `lib/`, `Build.PL`, `PRINTBOT_UITEST` hooks, action/command dispatch and the
 wx event plumbing; `resources/hms` (Device tab HMS texts); macOS/Windows sources (`*.mm`, `dark_mode.cpp`, ...).
 

@@ -3185,6 +3185,10 @@ void SelectMachineDialog::Enable_Auto_Refill(bool enable)
 
 void SelectMachineDialog::on_send_print()
 {
+    // Consume at entry, including attempts that fail validation/export before transport.
+    auto mcp_check = std::move(m_mcp_final_check);
+    m_mcp_final_check = nullptr;
+    const auto mcp_expires = m_mcp_final_expires;
     BOOST_LOG_TRIVIAL(info) << "print_job: on_ok to send";
     m_is_canceled = false;
     Enable_Send_Button(false);
@@ -3417,6 +3421,20 @@ void SelectMachineDialog::on_send_print()
         agent->track_update_property(dev_ota_str, obj_->get_ota_version());
     }
 
+    std::string mcp_reason;
+    bool mcp_ok = true;
+    if (mcp_check) {
+        mcp_ok = false;
+        if (std::chrono::steady_clock::now() <= mcp_expires) {
+            try { mcp_ok = mcp_check(mcp_reason); } catch (...) { mcp_ok = false; }
+        }
+    }
+    if (!mcp_ok) {
+        m_print_job.reset();
+        prepare_mode();
+        m_status_bar->set_status_text(_L("print_bot: the approved print changed or approval expired; nothing was sent."));
+        return;
+    }
     m_print_job->start();
     BOOST_LOG_TRIVIAL(info) << "print_job: start print job";
 }

@@ -258,16 +258,12 @@ struct Updates
 };
 
 
-wxDEFINE_EVENT(EVT_SLIC3R_EXPERIMENTAL_VERSION_ONLINE, wxCommandEvent);
-
 
 struct PresetUpdater::priv
 {
 	std::vector<Index> index_db;
 
-	bool enabled_version_check;
 	bool enabled_config_update;
-	std::string version_check_url;
 
 	fs::path cache_path;
 	fs::path rsrc_path;
@@ -322,9 +318,7 @@ PresetUpdater::priv::priv()
 	, cancel(false)
 {
 	//BBS: refine preset updater logic
-	enabled_version_check = true;
-	version_check_url = GUI::wxGetApp().app_config->version_check_url();
-	enabled_config_update = version_check_url.empty();
+	enabled_config_update = true; // print_bot: profiles come only from bundled resources; there is no app version check
 	// Install indicies from resources. Only installs those that are either missing or older than in resources.
 	check_installed_vendor_profiles();
     perform_updates(get_printer_config_updates(), false);
@@ -935,11 +929,6 @@ void PresetUpdater::do_printer_config_update()
     } else {
         BOOST_LOG_TRIVIAL(info) << "User refused the update";
     }
-}
-
-bool PresetUpdater::version_check_enabled() const
-{
-	return p->enabled_version_check;
 }
 
 }

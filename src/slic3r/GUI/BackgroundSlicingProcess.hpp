@@ -17,6 +17,7 @@
 #include "PartPlate.hpp"
 
 namespace boost { namespace filesystem { class path; } }
+namespace printbot { namespace core { class EventBus; } }
 
 namespace Slic3r {
 
@@ -98,20 +99,11 @@ public:
 	GUI::PartPlate* get_current_plate() { return m_current_plate; }
 	GCodeProcessorResult* get_current_gcode_result() { return m_gcode_result;}
 
-	// The following wxCommandEvent will be sent to the UI thread / Plater window, when the slicing is finished
-	// and the background processing will transition into G-code export.
-	// The wxCommandEvent is sent to the UI thread asynchronously without waiting for the event to be processed.
-	void set_slicing_completed_event(int event_id) { m_event_slicing_completed_id = event_id; }
-	// The following wxCommandEvent will be sent to the UI thread / Plater window, when the G-code export is finished.
-	// The wxCommandEvent is sent to the UI thread asynchronously without waiting for the event to be processed.
-	void set_finished_event(int event_id) { m_event_finished_id = event_id; }
-	// The following wxCommandEvent will be sent to the UI thread / Plater window, when the G-code is being exported to
-	// specified path or uploaded.
-	// The wxCommandEvent is sent to the UI thread asynchronously without waiting for the event to be processed.
-	void set_export_began_event(int event_id) { m_event_export_began_id = event_id; }
-
-	// BBS
-	void set_export_finished_event(int event_id) { m_event_export_finished_id = event_id; }
+	// print_bot: progress milestones (slicing completed, process completed/cancelled/failed, export began/finished)
+	// are published on the core EventBus (Topic::Slice, keys in core/SliceEvents.hpp) from the background thread,
+	// instead of being posted as wx events. The Plater subscribes with a CallAfter dispatcher and re-emits its
+	// existing wx events (EVT_SLICING_COMPLETED, EVT_PROCESS_COMPLETED, EVT_EXPORT_BEGAN, EVT_EXPORT_FINISHED).
+	void set_event_bus(printbot::core::EventBus *bus) { m_events = bus; }
 
 	// Activate either m_fff_print or m_sla_print.
 	// Return true if changed.
@@ -300,14 +292,12 @@ private:
 	// To be called from inside m_mutex to cancel a planned UI task.
 	static void			cancel_ui_task(std::shared_ptr<BackgroundSlicingProcess::UITask> task);
 
-	// wxWidgets command ID to be sent to the plater to inform that the slicing is finished, and the G-code export will continue.
-	int 						m_event_slicing_completed_id 	= 0;
-	// wxWidgets command ID to be sent to the plater to inform that the task finished.
-	int 						m_event_finished_id  			= 0;
-	// wxWidgets command ID to be sent to the plater to inform that the G-code is being exported.
-	int                         m_event_export_began_id         = 0;
-	// wxWidgets command ID to be sent to the plater to inform that the G-code is exported end.
-	int							m_event_export_finished_id		= 0;
+	// print_bot: core event bus the milestones are published on (owned by the app's Core; may be null in tests).
+	printbot::core::EventBus   *m_events = nullptr;
+	void                        publish_slicing_completed(int timestamp);
+	void                        publish_process_completed(int status, std::exception_ptr exception);
+	void                        publish_export_began();
+	void                        publish_export_finished(const std::string &path);
 
 };
 
