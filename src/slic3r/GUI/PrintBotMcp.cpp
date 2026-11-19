@@ -1,5 +1,4 @@
 #include "PrintBotMcp.hpp"
-#include "PrintBotApproval.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -59,7 +58,7 @@ std::vector<std::string> probe_modal_dialogs(double timeout_s)
         json titles = json::array();
         for (wxWindow *w : wxTopLevelWindows) {
             auto *d = dynamic_cast<wxDialog *>(w);
-            if (d && d->IsShown() && d->IsModal() && !is_approval_window(d)) titles.push_back(d->GetTitle().ToUTF8().data());
+            if (d && d->IsShown() && d->IsModal()) titles.push_back(d->GetTitle().ToUTF8().data());
         }
         std::lock_guard<std::mutex> lk(call->m);
         call->result = std::move(titles);

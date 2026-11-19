@@ -62,7 +62,7 @@
 #include "Selection.hpp"
 #include "SelectMachine.hpp"
 #include "Jobs/PrintJob.hpp"
-#include "PrintBotApproval.hpp"
+#include "mcp/PrintAuthorization.hpp"
 #include "SyncAmsInfoDialog.hpp"
 #include "Tab.hpp"
 #include "ParamsDialog.hpp"
@@ -572,7 +572,6 @@ std::vector<wxTopLevelWindow *> shown_dialogs()
     for (wxWindow *w : wxTopLevelWindows) {
         auto *tlw = dynamic_cast<wxTopLevelWindow *>(w);
         if (!tlw || !tlw->IsShown() || tlw == wxGetApp().mainframe) continue;
-        if (is_approval_window(tlw)) continue; // the human-only print approval is invisible to MCP
         if (!dynamic_cast<wxDialog *>(tlw) && tlw->GetTitle().empty() &&
             !dynamic_cast<SyncNozzleAndAmsDialog *>(tlw) && !dynamic_cast<FinishSyncAmsDialog *>(tlw)) continue; // popups / tooltips
         out.push_back(tlw);
@@ -873,14 +872,6 @@ json slice(ToolContext &ctx, const json &a)
 }
 
 // ---------------------------------------------------------------------------------------------
-// print approval gate and send tracking
-//
-// Every MCP route that could send a print goes through gated_send(): generic dialog tools refuse
-// to act while a Print / Send dialog is open, and click_window() refuses any widget inside one.
-// gated_send() binds a human approval, given only in the native PrintBotApproval dialog (which
-// MCP cannot see or click), to the exact job facts, and re-checks them on the main thread in the
-// same step that presses Send. Each approval is consumed by that one attempt.
-
 std::string to_hex(const unsigned char *md, unsigned n)
 {
     static const char *digits = "0123456789abcdef";
@@ -931,8 +922,7 @@ std::string config_digest(const DynamicPrintConfig &cfg)
 
 std::string jstr(const json &v) { return v.is_string() ? v.get<std::string>() : v.is_null() ? std::string() : v.dump(); }
 
-// Test instances only: PRINTBOT_MCP_TEST_NO_SEND=1 runs the whole gate (approval dialog,
-// fingerprint checks, single use) but never presses Send and does not need a ready printer.
+// Test mode validates authorization without sending a print.
 bool test_no_send()
 {
     const char *e = std::getenv("PRINTBOT_MCP_TEST_NO_SEND");
@@ -965,8 +955,7 @@ void refuse_in_print_dialogs()
 {
     if (print_dialog_shown())
         throw ToolError{"print.human_only",
-                        "the Print / Send dialog is open: only the user may operate it. Use print_plate (which asks the user in print_bot's own "
-                        "approval dialog), let the user act, or cancel it with ui_close_dialog."};
+                        "the Print / Send dialog is open: use print_plate with one explicit human print request, or cancel with ui_close_dialog."};
 }
 
 json printer_identity(MachineObject *o)
@@ -1042,8 +1031,8 @@ std::string changed_parts(const json &a, const json &b)
     return out.empty() ? "unknown" : out;
 }
 
-// The text the human approves. Main thread.
-std::string approval_summary(const json &job, const json &dlg, const json &slice, MachineObject *m)
+// Printable job and destination summary.
+std::string print_summary(const json &job, const json &dlg, const json &slice, MachineObject *m)
 {
     std::string s;
     auto        line = [&](const std::string &k, const std::string &v) { s += k + std::string(k.size() < 16 ? 16 - k.size() : 1, ' ') + v + "\n"; };
@@ -1251,7 +1240,7 @@ struct Waiter
 };
 
 // The single authorization gate for sending a print over MCP. The Print dialog must be open.
-json gated_send(const json &pre, double approval_timeout_s)
+json gated_send(const json &pre, const std::string &authorization_id)
 {
     const bool test = test_no_send();
     // 1. Freeze the job facts and build the summary the human will see.
@@ -1260,7 +1249,7 @@ json gated_send(const json &pre, double approval_timeout_s)
         if (!dlg) throw ToolError{"print.no_dialog", "the Print dialog is not open"};
         json job = job_facts();
         if (sha256_hex(job.dump()) != pre["job_fingerprint"].get<std::string>())
-            throw ToolError{"approval.stale", "the job changed while the Print dialog opened; run print_plate dry_run again and ask again"};
+            throw ToolError{"approval.stale", "the job changed while the Print dialog opened; run print_plate dry_run again and verify it still matches the human request"};
         json df = dialog_facts(dlg);
         if (!test) {
             const std::string want = pre.contains("printer") ? jstr(pre["printer"]["id"]) : std::string();
@@ -1270,29 +1259,16 @@ json gated_send(const json &pre, double approval_timeout_s)
         json facts = {{"job", job}, {"dialog", df}};
         return json{{"facts", facts},
                     {"fingerprint", sha256_hex(facts.dump())},
-                    {"summary", approval_summary(job, df, pre["job"]["slice"], dlg->get_current_machine())}};
+                    {"summary", print_summary(job, df, pre["job"]["slice"], dlg->get_current_machine())}};
     });
     const std::string fp = snap["fingerprint"].get<std::string>();
 
-    // 2. Human approval in the native dialog. MCP cannot see or answer it.
-    auto approval = std::make_shared<Waiter>();
-    const int timeout = int(approval_timeout_s);
-    post_to_main([approval, summary = snap["summary"].get<std::string>(), fp, timeout]() {
-        wxWindow *parent = shown_select_machine_dialog();
-        if (!parent) parent = wxGetApp().mainframe;
-        const bool ok = run_print_approval_dialog(parent, wx(summary), fp, timeout);
-        approval->finish(ok);
-    });
-    if (!approval->wait(approval_timeout_s + 60)) throw ToolError{"approval.timeout", "no answer in print_bot's approval dialog; nothing was sent"};
-    if (!approval->ok) throw ToolError{"print.not_approved", "the user did not approve this print in print_bot's approval dialog; nothing was sent"};
-
-    // 3. Consume the approval: re-check the live state and press Send in one main-thread step.
     auto op         = std::make_shared<SendOp>();
     op->id          = "print-" + std::to_string(++g_op_seq) + "-" + fp.substr(0, 8);
     op->fingerprint = fp;
     op->test_mode   = test;
     auto gate       = std::make_shared<Waiter>();
-    post_to_main([gate, op, facts = snap["facts"], test]() {
+    post_to_main([gate, op, facts = snap["facts"], test, authorization_id]() {
         try {
             SelectMachineDialog *dlg = shown_select_machine_dialog();
             if (!dlg) return gate->finish(false, "print.no_dialog", "the Print dialog was closed after approval; nothing was sent");
@@ -1300,12 +1276,20 @@ json gated_send(const json &pre, double approval_timeout_s)
             const json now = {{"job", job_facts()}, {"dialog", dialog_facts(dlg)}};
             if (now != facts)
                 return gate->finish(false, "approval.stale",
-                                    "changed after approval (" + changed_parts(facts, now) + "); nothing was sent. Present the new job and ask again.");
+                                    "changed after approval (" + changed_parts(facts, now) + "); nothing was sent. Verify the changed job remains within the human request before retrying.");
             wxWindow *b = find_button(dlg, "Send");
             if (!test) {
                 if (!b) return gate->finish(false, "print.no_button", "no Send button in the Print dialog; nothing was sent");
                 if (!b->IsEnabled()) return gate->finish(false, "print.blocked", "Send is disabled in the Print dialog (see its message); nothing was sent");
             }
+            if (!test && !facts["dialog"].value("mapping_valid", false))
+                return gate->finish(false, "print.blocked", "filament mapping is invalid; nothing was sent");
+            const auto authorization = printbot::mcp::consume_print_authorization(
+                std::filesystem::path(Slic3r::data_dir()) / "mcp-print-authorizations", authorization_id);
+            if (authorization == printbot::mcp::AuthorizationResult::reused)
+                return gate->finish(false, "approval.used", "this human print request was already consumed; do not retry with a new ID");
+            if (authorization != printbot::mcp::AuthorizationResult::consumed)
+                return gate->finish(false, "approval.unavailable", "could not persist the single-use print authorization; nothing was sent");
             MachineObject *m   = dlg->get_current_machine();
             op->dev_id         = m ? m->get_dev_id() : std::string();
             op->printer_name   = m ? m->get_dev_name() : std::string();
@@ -1373,6 +1357,8 @@ json gated_send(const json &pre, double approval_timeout_s)
     return json{{"status", st.value("status", std::string("send_requested"))},
                 {"operation_id", op->id},
                 {"approved_fingerprint", fp},
+                {"authorization_id", authorization_id},
+                {"summary", snap["summary"]},
                 {"operation", st},
                 {"preflight", pre},
                 {"note", "Send was requested after the user's approval. This is not proof that the printer accepted the job: poll "
@@ -1426,7 +1412,7 @@ json status_json(ToolContext &ctx)
         j["ui"]                      = ui_state_json();
         j["printer_control_allowed"] = printer_control_allowed();
         j["approval_required_before_every_print"] = true;
-        j["print_approval"] = "native print_bot dialog, user only";
+        j["print_approval"] = "one explicit human chat request authorizes one print attempt; no approval popup";
         if (test_no_send()) j["test_no_send"] = true;
         if (DeviceManager *d = wxGetApp().getDeviceManager())
             if (MachineObject *o = d->get_selected_machine()) j["selected_printer"] = printer_brief(o, o);
@@ -1443,15 +1429,6 @@ struct Reg
     std::vector<Tool> &t;
     void operator()(std::string name, std::string title, std::string desc, json schema, bool read_only, std::function<json(ToolContext &, const json &)> h)
     {
-        {
-            // While the user decides in the print approval dialog, MCP can do nothing at all.
-            auto inner = std::move(h);
-            h          = [inner](ToolContext &ctx, const json &a) {
-                if (approval_dialog_open())
-                    throw ToolError{"approval.pending", "print_bot is waiting for the user to answer its print approval dialog; every MCP call is refused until then"};
-                return inner(ctx, a);
-            };
-        }
         if (!read_only) {
             auto inner = std::move(h);
             h          = [title, inner](ToolContext &ctx, const json &a) {
@@ -2321,29 +2298,31 @@ std::vector<Tool> make_gui_tools()
 
     // ---------------- print jobs (policy-gated) ----------------
     add("print_plate", "Print plate",
-        "Send the sliced current plate to the selected printer. Default dry_run = true: checks readiness (sliced, printer "
-        "connected and idle) and returns the job summary plus its job_fingerprint; nothing is opened or sent. open_dialog = true "
-        "opens the Print dialog for the user to review. A real send needs printer control enabled by the user (env "
-        "PRINTBOT_MCP_ALLOW_PRINTER_CONTROL=1 or app config mcp_allow_printer_control = true), dry_run = false and the "
-        "job_fingerprint of the dry run you presented. print_bot then opens the Print dialog and asks the user in its own "
-        "approval dialog, which lists the job, printer, filament mapping and estimates; only the user's click there approves, and "
-        "MCP calls are refused while it is open. The approval is single-use and bound to the job: if anything changed, the call "
-        "returns approval.stale and nothing is sent. Success returns status send_requested and an operation_id, not proof of "
-        "printing: poll get_print_operation. " + printbot::mcp::print_approval_instructions(),
+        "Send one sliced plate for one explicit human print request, without an approval popup. Default dry_run=true returns "
+        "readiness, job summary and job_fingerprint. A real send requires printer control, dry_run=false, fingerprint, "
+        "user_authorized=true and a stable authorization_id identifying that human request. Reuse the same ID for retries; "
+        "it is persisted and consumed before the first send attempt, including failures. Never generate another ID unless "
+        "the human issues another print instruction. Changed job facts are rejected. Poll get_print_operation for the result. " +
+        printbot::mcp::print_approval_instructions(),
         schema({{"dry_run", prop("boolean", "Only check readiness and return the summary and job_fingerprint (default true).")},
-                {"fingerprint", prop("string", "job_fingerprint from the dry run whose summary you showed the user. Required with dry_run=false.")},
-                {"approval_timeout_s", prop("number", "How long print_bot's approval dialog waits for the user (default 600, 60..1800).")},
+                {"fingerprint", prop("string", "job_fingerprint from the current dry run. Required with dry_run=false.")},
+                {"user_authorized", prop("boolean", "True only for an explicit human request to print this job; required for a real send.")},
+                {"authorization_id", prop("string", "Stable unique ID for that human request, 1..128 ASCII letters, digits, hyphens or underscores. Reuse across retries and restarts; never derive from the job fingerprint.")},
                 {"open_dialog", prop("boolean", "Open the Print dialog without sending (default false).")}}),
         false, [](ToolContext &, const json &a) {
             const bool        dry = bool_arg(a, "dry_run", true), open = bool_arg(a, "open_dialog", false);
             const std::string want_fp = str_arg(a, "fingerprint");
-            const double      approval_timeout = std::clamp(num_arg(a, "approval_timeout_s", 600), 60.0, 1800.0);
+            const std::string authorization_id = str_arg(a, "authorization_id");
             if (!dry) {
                 require_policy("starting a print");
+                if (!bool_arg(a, "user_authorized", false))
+                    throw ToolError{"print.not_authorized", "an explicit human print request is required; set user_authorized only for that request"};
+                if (authorization_id.empty() || authorization_id.size() > 128 ||
+                    authorization_id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != std::string::npos)
+                    throw ToolError{"invalid_argument", "authorization_id must contain 1..128 ASCII letters, digits, hyphens or underscores"};
                 if (want_fp.empty())
                     throw ToolError{"print.fingerprint_required",
-                                    "run print_plate with dry_run = true, present its job summary to the user, then pass its job_fingerprint. "
-                                    "The user approves in print_bot's own approval dialog; nothing an agent passes counts as approval."};
+                                    "run print_plate with dry_run=true, then pass its job_fingerprint for the explicitly requested print"};
             }
             json pre = on_main([]() {
                 Plater    &p  = plater();
@@ -2353,7 +2332,7 @@ std::vector<Tool> make_gui_tools()
                 j["sliced"]  = pp->is_slice_result_valid();
                 j["control_allowed"] = printer_control_allowed();
                 j["approval_required_before_every_print"] = true;
-                j["approval"] = "print_bot asks the user in its own approval dialog on every send; present this summary first";
+                j["approval"] = "one explicit human chat request authorizes one print attempt; no approval popup";
                 j["approval_instructions"] = printbot::mcp::print_approval_instructions();
                 std::map<uint64_t, json> by_object;
                 for (const auto &oi : pp->get_obj_and_inst_set()) {
@@ -2389,7 +2368,7 @@ std::vector<Tool> make_gui_tools()
             if (dry && !open) {
                 pre["dry_run"] = true;
                 pre["would"]   = "open the Print dialog for plate " + std::to_string(pre["plate"].get<int>()) +
-                               ", ask the user in print_bot's approval dialog, and press Send only if they approve this exact job";
+                               ", consume one explicit human print request, and send once without an approval popup";
                 return pre;
             }
             if (!pre["sliced"].get<bool>()) throw ToolError{"print.not_sliced", "slice the plate first"};
@@ -2398,7 +2377,7 @@ std::vector<Tool> make_gui_tools()
                 if (pre["job_fingerprint"].get<std::string>() != want_fp)
                     throw ToolError{"approval.stale", "the job changed since the summary with fingerprint " + want_fp.substr(0, 16) +
                                                           " (now " + pre["job_fingerprint"].get<std::string>().substr(0, 16) +
-                                                          "). Run dry_run again, present the new summary and ask again. Nothing was sent."};
+                                                          "). Run dry_run again and verify the job remains within the human request. Nothing was sent."};
             }
             const bool already_open = on_main([]() { return json(shown_select_machine_dialog() != nullptr); }).get<bool>();
             if (!already_open) post_to_main([]() { wxPostEvent(&plater(), SimpleEvent(EVT_GLTOOLBAR_PRINT_PLATE)); });
@@ -2410,7 +2389,7 @@ std::vector<Tool> make_gui_tools()
             if (dlg.is_null()) throw ToolError{"print.no_dialog", "the Print dialog did not open"};
             if (dry) return json{{"dialog_open", true}, {"status", "not_sent"}, {"preflight", pre}};
             sleep_ms(1500); // the dialog fetches printer state / thumbnails / mapping
-            return gated_send(pre, approval_timeout);
+            return gated_send(pre, authorization_id);
         });
 
     add("get_print_operation", "Get print operation",
@@ -2597,7 +2576,7 @@ std::vector<Tool> make_gui_tools()
 
     add("ui_dialog_click", "Click dialog button",
         "Click a button in a dialog by label (e.g. 'OK', 'Don't save', 'Transfer') or widget number. Refused while a Print / Send "
-        "dialog is open (those are for the user only; prints go through print_plate and print_bot's own approval dialog).",
+        "dialog is open (prints go through print_plate with a single-use human chat authorization).",
         schema({{"dialog", kDialogProp}, {"button", prop("string", "Button label (case-insensitive).")}, {"widget", prop("integer", "Widget number.")}}),
         false, [](ToolContext &, const json &a) {
             auto      label  = opt_str(a, "button");

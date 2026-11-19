@@ -235,8 +235,6 @@ set(SLIC3R_GUI_SOURCES
     GUI/PrintBotMcp.cpp
     GUI/PrintBotMcp.hpp
     GUI/PrintBotMcpTools.cpp
-    GUI/PrintBotApproval.cpp
-    GUI/PrintBotApproval.hpp
     GUI/PartPlate.cpp
     GUI/PartPlate.hpp
     GUI/WipeTowerPlacement.cpp

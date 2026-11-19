@@ -196,40 +196,41 @@ don't blindly repeat it.
 
 `printer` accepts the serial, the name, or the IP from `list_printers`.
 
-### 8. Sending a print (fresh approval for every print)
+### 8. Sending a print (one human instruction, one attempt)
 
-1. Before preparing EVERY print approval, run `ui_open_dialog {dialog: "sync_info"}`. This is
-   the sidebar **Sync Info** action for nozzle and AMS information. Inspect its dialog and
-   choose **Continue to sync filaments**. If that temporary prompt has disappeared, run
-   `ui_open_dialog {dialog: "sync_filaments"}` instead. Inspect the synchronization choices,
-   complete **Synchronize now**, and verify the resulting presets, source labels and colors
-   with `get_selected_presets` and `get_printer_status`. Opening a dialog alone is not a
-   completed sync. Preserve intentional project overrides and handle any unsaved-edit prompt.
-   Then prepare and slice the exact plate. Re-slice after sync changes settings; any earlier
-   approval must be renewed after such changes. Read `get_printer_status` and run `print_plate {}`
-   (dry run). Its `job`, `printer`, `presets` and slice summary describe the proposed print.
-   Open the Print dialog with `print_plate {open_dialog: true}`, then use `ui_dialog_inspect`
-   to verify its actual `printer`, `filament_mapping_valid`, `filament_mapping` and
-   `filament_mapping_info`. Mapping entries follow project filament order; AMS and slot IDs
-   are the printer's raw IDs. Compare them with `get_printer_status` before presenting approval.
-2. Present the project/file, plate, object names and copy counts, destination printer name/model
-   (plus a distinguishing identifier if needed), material and filament mapping, estimated time
-   and material use. Ask: "Start this specific job on this specific printer?"
-3. **Wait for the human user's explicit affirmative answer to that summary.** This is required
-   for EVERY print, even when the user already asked to print in general or enabled MCP control.
-   An earlier print's approval never authorizes another print.
-4. Call `print_plate {dry_run: false, fingerprint: <job_fingerprint of the dry run you presented>}`.
-   print_bot opens its own native **Approve print** dialog; only the user's click there approves.
-   Tell the user to review and approve it in print_bot. While it is open, every tool call returns
-   `approval.pending`; you cannot see, inspect or click it, and Print/Send dialog buttons and fields
-   are never clickable or settable over MCP (`print.human_only`). Do not try other routes.
-5. If the job, settings, material, mapping or destination changed, the call returns
-   `approval.stale` and nothing is sent. Present the new summary, get fresh agreement, and start again
-   from a new dry run. Approval is single-use; every retry or repeat needs a new dialog.
-6. Success returns `status: send_requested` and an `operation_id`; it does not mean the printer
-   accepted the job. Poll `get_print_operation {operation_id}` and report only what it shows
-   (`uploading`, `transferred_awaiting_printer`, `printing`, `failed`, `not_sent`, ...). Report
-   `unknown` as unknown and never resend automatically.
+An explicit human instruction such as **"Print this"** or **"Go ahead and now print"** authorizes
+exactly one print of the identified job. Do not ask for another chat confirmation or native approval
+popup. Repeated confirmations of the same pending job are still one request, not queued copies.
+Ask only if the job is ambiguous or a material change falls outside the requested scope.
+
+1. Complete `ui_open_dialog {dialog: "sync_info"}` and **Continue to sync filaments**. If the
+   temporary prompt disappears, use `sync_filaments`. Complete synchronization, then verify
+   presets and native tray labels such as **HT-A** with `get_selected_presets` and
+   `get_printer_status`. Re-slice after any settings change.
+2. Prepare the requested plate, inspect the slice, check the idle printer and filament, and run
+   `print_plate {}` for the `job_fingerprint`. Open the Print dialog with
+   `print_plate {open_dialog: true}` and inspect the actual printer and valid filament mapping.
+   Report the project, plate, objects/copies, destination, material/source, time and usage as
+   information, without asking for approval again.
+3. Assign a stable `authorization_id` to the human request: use its conversation/message identity
+   when available, or record a fresh UUID once. Use only ASCII letters, digits, hyphens and
+   underscores, at most 128 characters. Keep the SAME ID across retries, reconnects and restarts.
+   Never derive it from the job fingerprint or invent a replacement for a consumed request.
+4. Call `print_plate {dry_run: false, fingerprint: "...", user_authorized: true,
+   authorization_id: "..."}`. The server consumes that request persistently before its first send
+   attempt and checks job facts and actual dialog mapping again immediately before transport.
+   There is no approval popup. Generic Print/Send dialog controls remain unavailable to MCP.
+5. `approval.used` means the request already attempted a send, including attempts that failed.
+   Never work around it with another ID. `approval.stale` means nothing was sent because the job
+   changed; re-check against the human's requested scope and reuse the SAME authorization ID.
+   An uncertain outcome must never cause an automatic resend. A repeat or a retry after a
+   consumed attempt needs a new explicit human print instruction.
+6. Poll `get_print_operation` and report only the observed state. `send_requested` is not proof
+   the printer started; report started only when the matching job is reported as `printing`.
+
+The agent attests human authorization; the server cannot authenticate conversation intent.
+The persistent request ID prevents replay across MCP clients and app restarts using the same app
+configuration directory. Do not delete its `mcp-print-authorizations` directory to retry a print.
 
 `printer_control {action: "pause" | "resume" | "stop", dry_run, confirm}` still requires
 an explicit user request for that particular action. Enabling control authorizes no job or action.
@@ -242,10 +243,10 @@ an explicit user request for that particular action. Enabling control authorizes
   {dry_run:false}` return **`policy.denied`** until the user starts print_bot with
   `PRINTBOT_MCP_ALLOW_PRINTER_CONTROL=1` or sets `mcp_allow_printer_control = true` in the app config.
   An agent may enable this only when the human explicitly authorizes enabling MCP printer control.
-  That authorization is separate from, and does not replace, fresh approval for every print.
-- Even with control enabled: finish the dry run, present the exact job and destination printer
-  with material, mapping, time and usage, and obtain fresh explicit approval for each print.
-  Never reuse approval or infer it from silence. The native approval dialog is the user's alone.
+  That authorization does not replace an explicit human instruction for each print.
+- Even with control enabled, each print needs one explicit human instruction. Finish preflight and
+  report the exact job and mapping, then proceed without another approval. Never reuse a consumed
+  authorization or infer one from silence.
 - Before printing, check `get_printer_status`: not `busy`, the right filament in the AMS, and no HMS errors.
 - Don't discard the user's unsaved project or preset edits without asking.
 - Don't paste access codes, serials, or IPs into files or messages unless needed.
@@ -260,10 +261,11 @@ Failed calls return `isError: true` with `{"error": {"code", "message"}}`. The m
 | `ui.blocked_by_dialog` | A modal dialog is waiting. Handle it (workflow 6). |
 | `ui.timeout`, `app.not_ready`, `app.exiting` | The app is busy, starting up, or closing. Wait and call `get_status`. |
 | `policy.denied` | Printer control is off. Obtain explicit user authorization before enabling it. |
-| `print.fingerprint_required` | Run the dry run, present its summary, then pass its `job_fingerprint`. |
-| `approval.pending` | print_bot's approval dialog is open for the user. Wait; do not retry other tools in a loop. |
-| `approval.stale` | The job changed since it was summarized or approved. Nothing was sent. Start again from a dry run. |
-| `print.not_approved`, `approval.timeout` | The user cancelled or did not answer. Nothing was sent. Do not ask again unprompted. |
+| `print.fingerprint_required` | Run the dry run and pass its `job_fingerprint`. |
+| `approval.stale` | The job changed. Nothing was sent. Re-check the requested scope and dry run; retain the request ID. |
+| `print.not_authorized` | An explicit human print instruction is missing. |
+| `approval.used` | This request was consumed. Never retry it or substitute a new ID. |
+| `approval.unavailable` | The authorization ledger could not be written. Nothing was sent. |
 | `print.human_only` | Print/Send dialog controls are for the user only. Use `print_plate`. |
 | `print.unknown`, `print.no_operation` | The outcome is not known. Check `get_print_operation` and printer status; never resend automatically. |
 | `printer.not_confirmed` | Set `confirm: true` only after an explicit request for this specific printer action. |

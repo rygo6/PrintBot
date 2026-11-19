@@ -132,38 +132,36 @@ the app with `PRINTBOT_MCP_ALLOW_PRINTER_CONTROL=1` or sets `mcp_allow_printer_c
 app config. An agent may enable this only with explicit human authorization to enable MCP control.
 Enabling control is an additional requirement; it never approves a print.
 
-Before preparing every approval, run the sidebar Sync Info action (`ui_open_dialog` with
-`sync_info`) and complete Continue to sync filaments (`sync_filaments` can reopen that step). Verify
-actual presets and native feeder labels such as HT-A, then re-slice if synchronization changed
-settings. Opening a synchronization dialog alone is not success. The agent still presents the exact
-project/plate/objects/copies, destination printer, filament mapping, estimated time and material
-use, and asks before every print.
+Before every print, complete Sync Info and filament synchronization, verify native feeder labels
+such as HT-A and printer readiness, then slice. An explicit human instruction such as "Print this"
+authorizes exactly one print of that identified job. The agent reports the exact project, plate,
+objects/copies, printer, filament mapping, time and usage without asking for another confirmation.
+Repeated confirmations of the same pending job never queue additional prints.
 
-**The human authorization gate.** Every MCP print goes through one gate (`print_plate`, nothing else):
-1. `print_plate {}` (dry run) returns the job summary and a `job_fingerprint` (SHA-256 over the
-   project, plate, object instances, G-code file, selected presets, full and plate settings, and
-   destination printer).
-2. `print_plate {dry_run: false, fingerprint}` requires printer control, refuses a changed job
-   (`approval.stale`), opens the Print dialog if needed, and freezes the job plus the dialog's actual
-   destination, filament mapping and options into an immutable approval fingerprint.
-3. print_bot shows its own native modal **Approve print** dialog with a read-only summary. Cancel is
-   the default, Approve is disabled for 1.5 s and needs a real mouse press or key press on the button.
-   The dialog is invisible to MCP: it is not listed or inspectable, and every MCP tool call returns
-   `approval.pending` while it is open. Print/Send dialog buttons and fields cannot be clicked or set
-   through MCP at all (`print.human_only`); `confirm` arguments are ignored.
-4. After approval the gate rechecks control policy and the full fingerprint, then presses Send.
-   The Print dialog runs the same check again immediately before the print job starts transport
-   (after any warnings the user answers). Any difference aborts with nothing sent. The approval is
-   single-use: it is consumed by the first send attempt, expires after 10 minutes, and every retry
-   or repeat needs a new dialog.
-5. Success returns `status: send_requested` (or a later observed state) and an `operation_id`, never
-   "sent". `get_print_operation` reports the transfer (`send_requested`, `awaiting_user_confirmation`,
-   `uploading`, `transferred`, `failed`, `not_sent`) and the printer's own report (`printing`, `paused`,
-   `finished`, `printer_failed`, `no_matching_job_reported`). Anything not observed stays `unknown`.
-   Never resend because an outcome is unknown.
+**Single-use chat authorization.** Every MCP print goes through `print_plate`:
+1. A dry run returns the job summary and `job_fingerprint`, covering the project, plate, object
+   instances, G-code, presets, full/plate settings and printer. Inspect the actual Print dialog
+   mapping before sending.
+2. A real call requires printer control, `dry_run: false`, `fingerprint`, `user_authorized: true`
+   and `authorization_id`. The ID identifies the human request, not the job: a conversation/message
+   identity or a UUID recorded once, using 1..128 ASCII letters, digits, hyphens or underscores.
+   Retain it across retries, reconnections and restarts. A new ID requires a new human instruction.
+3. There is no native approval popup. The server checks the fingerprint, actual printer, mapping
+   and readiness, then atomically consumes the ID by creating a marker under the app configuration
+   directory's `mcp-print-authorizations`. Failed writes prevent sending; an existing marker returns
+   `approval.used`. Consumption precedes the send attempt, including attempts that later fail.
+4. The frozen job and mapping are checked again immediately before transport. Changed facts return
+   `approval.stale`; retries retain the original ID and must remain within the requested scope.
+   Print/Send dialog buttons remain inaccessible to generic MCP controls. Genuine printer or job
+   warnings may still block sending; never blindly dismiss them or bypass checks.
+5. `get_print_operation` reports transfer and matching printer state. `send_requested` does not mean
+   the printer started. Never resend on an unknown outcome, and never delete ledger markers or
+   generate replacement IDs to retry a consumed request.
 
-The headless server has no print routes and never sends. For tests, `PRINTBOT_MCP_TEST_NO_SEND=1`
-runs the whole gate but never presses Send.
+The agent is trusted to attest the human's request: the server cannot authenticate chat intent.
+Replay protection persists across clients and restarts using the same app configuration directory.
+The headless server cannot print. `PRINTBOT_MCP_TEST_NO_SEND=1` exercises the gate and consumes IDs
+but never presses Send. `python3 tests/mcp/test_print_authorization.py` tests the authorization ledger.
 
 Robustness: malformed JSON-RPC (wrong types for `id`, `method`, `params`, tool name, `arguments`,
 `_meta`, progress tokens, bad batches, parse errors) gets a JSON-RPC error on the same connection;

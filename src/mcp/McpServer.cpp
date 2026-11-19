@@ -15,24 +15,22 @@ const char *kSupportedVersions[] = {"2025-06-18", "2025-03-26", "2024-11-05"};
 
 std::string print_approval_instructions()
 {
-    return "Before preparing EVERY print approval, use live ui_open_dialog with dialog=sync_info for the sidebar Sync Info action, "
-           "then complete Continue to sync filaments (or ui_open_dialog with dialog=sync_filaments if that prompt disappears). "
-           "Inspect and resolve the synchronization dialogs, verify the resulting filament presets and printer status, and slice "
-           "again if settings changed. Opening the workflow alone is not proof of completed sync. Identify the material source "
-           "using the printer status tray label, such as HT-A or A1, rather than calling every source slot 1. "
-           "Before EVERY individual print, run print_plate with dry_run=true and present the exact job to the human (project/file, "
-           "plate, object names and copy counts, destination printer name/model and a distinguishing identifier, filament/material "
-           "and mapping, estimated duration and material use), and ask whether to start that specific job on that specific printer. "
-           "Only after an affirmative reply call print_plate with dry_run=false and that dry run's job_fingerprint. print_bot then "
-           "shows the job in its own approval dialog; only the human's click there approves the send, agents cannot see or answer "
-           "it, and every MCP call is refused while it is open. Enabling MCP printer control, an earlier approval, a general "
-           "instruction to print or any argument an agent passes is not approval. Approval is single-use and bound to the job "
-           "fingerprint: changed job contents/settings/material/printer/mapping return approval.stale, and repeat prints and retries "
-           "need a new summary and approval. The Print and Send dialogs are human-only: ui_dialog_click and ui_dialog_set are "
-           "refused while one is open. print_plate returns status send_requested with an operation_id, which is not proof of "
-           "printing: poll get_print_operation and report printing as started only when it reports printing (the printer reported "
-           "the matching job). If an outcome is unknown or uncertain, inspect printer status and ask the human; never resend "
-           "automatically. The headless server has no print tools and can never send a print.";
+    return "An explicit human instruction such as 'Print this' or 'Go ahead and now print' authorizes exactly one print "
+           "of the identified job. Do not ask again in chat or require an approval popup. Multiple confirmations of the same "
+           "pending job do not authorize multiple prints. Before sending, complete Sync Info and filament synchronization, "
+           "verify printer readiness and native feeder labels such as HT-A, prepare and slice the requested plate, then run "
+           "print_plate dry_run=true and inspect the actual Print dialog mapping. Report the job, printer, material, mapping, "
+           "time and usage as information, not another approval question. Call print_plate with dry_run=false, fingerprint, "
+           "user_authorized=true and authorization_id. Use a stable unique ID for the human request (conversation/message ID "
+           "or a recorded UUID), containing only ASCII letters, digits, hyphens or underscores. Reuse it across retries, "
+           "reconnections and restarts; never derive it from job facts or mint another for the same request. The server persists "
+           "consumption before sending and rejects reuse with approval.used. A failed or uncertain send must never trigger "
+           "another print automatically. New prints need a new explicit human instruction. Printer control must be enabled "
+           "with human authorization. Changes outside the requested scope or ambiguous jobs still require clarification. "
+           "Fingerprints and final transport checks reject changed job, printer, mapping or settings. Print/Send controls remain "
+           "unavailable to generic dialog tools; use print_plate. Poll get_print_operation and report started only when the "
+           "printer reports the matching job. The server trusts the agent to attest the human request; an ID is replay protection, "
+           "not independent authentication of chat intent. The headless server has no print tools and never sends.";
 }
 
 std::string headless_instructions()
