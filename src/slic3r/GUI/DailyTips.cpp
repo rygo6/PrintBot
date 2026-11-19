@@ -242,6 +242,8 @@ void DailyTipsDataRenderer::render_text(const ImVec2& start_pos, const ImVec2& s
 
 int DailyTipsPanel::uid = 0;
 
+DailyTipsPanel::~DailyTipsPanel() = default;
+
 DailyTipsPanel::DailyTipsPanel(bool can_expand, DailyTipsLayout layout)
     : m_pos(ImVec2(0, 0)),
     m_width(0),

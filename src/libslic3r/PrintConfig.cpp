@@ -9057,12 +9057,14 @@ std::vector<int> DynamicPrintConfig::update_values_to_printer_extruders(DynamicP
                     ConfigOptionBools * opt = this->option<ConfigOptionBools>(key);
                     if (!opt) continue;
                     std::vector<unsigned char> new_values;
+                    // Copy the raw bytes: get_at() returns bool&, and a nullable "nil" (255) read as bool is UB.
+                    auto raw_at = [opt](size_t i) { return i < opt->values.size() ? opt->values[i] : opt->values.front(); };
 
                     new_values.resize(variant_count * stride);
                     for (int e_index = 0; e_index < variant_count; e_index++)
                     {
                         for (unsigned int i = 0; i < stride; i++)
-                            new_values[e_index*stride + i] = opt->get_at(variant_index[e_index]*stride + i);
+                            new_values[e_index*stride + i] = raw_at(variant_index[e_index]*stride + i);
                     }
                     opt->values = new_values;
                     break;
@@ -9250,11 +9252,13 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
                     ConfigOptionBools * opt = this->option<ConfigOptionBools>(key);
                     if (!opt) continue;
                     std::vector<unsigned char> new_values;
+                    // Copy the raw bytes: get_at() returns bool&, and a nullable "nil" (255) read as bool is UB.
+                    auto raw_at = [opt](size_t i) { return i < opt->values.size() ? opt->values[i] : opt->values.front(); };
 
                     new_values.resize(filament_count);
                     for (int f_index = 0; f_index < filament_count; f_index++)
                     {
-                        new_values[f_index] = opt->get_at(variant_index[f_index]);
+                        new_values[f_index] = raw_at(variant_index[f_index]);
                     }
                     opt->values = new_values;
                     break;
@@ -9626,8 +9630,9 @@ void compute_filament_override_value(const std::string& opt_key, const ConfigOpt
     ConfigOptionFloatsNullable opt_retraction_distance_default;
     if (opt_key == "retraction_distances_when_cut" && new_full_config.option<ConfigOptionInt>("enable_long_retraction_when_cut")->value != LongRectrationLevel::EnableFilament) {
         auto ptr = dynamic_cast<const ConfigOptionFloatsNullable*>(opt_new_filament);
+        // Fill the float default (was pushing NaN nils into the bool option above: UB and an empty override).
         for (size_t idx = 0; idx < ptr->values.size(); ++idx)
-            opt_long_retraction_default.values.push_back(ptr->nil_value());
+            opt_retraction_distance_default.values.push_back(ptr->nil_value());
         opt_new_filament = &opt_retraction_distance_default;
     }
 

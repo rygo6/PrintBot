@@ -2,6 +2,7 @@
 #include <imgui/imgui_internal.h>
 
 #include "GizmoObjectManipulation.hpp"
+#include <cmath>
 
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 //#include "I18N.hpp"
@@ -505,6 +506,15 @@ void GizmoObjectManipulation::on_change(const std::string &opt_key, int axis, do
 
     if (m_imperial_units && (opt_key == "position" || opt_key == "size"))
         new_value *= in_to_mm;
+
+    // Reject typed values that would put geometry outside the slicer's 32-bit coordinate range (about +-21 m).
+    constexpr double max_extent_mm = 5000.;
+    if (!std::isfinite(new_value))
+        return;
+    if ((opt_key == "position" || opt_key == "size") && std::abs(new_value) > max_extent_mm)
+        return;
+    if (opt_key == "scale" && m_cache.scale(axis) > 0. && m_cache.size(axis) * new_value / m_cache.scale(axis) > max_extent_mm)
+        return;
 
     if (opt_key == "position")
         change_position_value(axis, new_value);

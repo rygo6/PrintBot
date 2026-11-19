@@ -10,7 +10,7 @@ plugin (vendored in `bambu_networking/`, AGPL-3.0-or-later; upstream commit in
 Slicing, the Prepare/Preview tabs, printer/filament/process presets and all
 LAN printer operations (discovery, add by IP + access code, upload, start,
 pause/resume/stop, live status, camera, AMS, calibration) work as in stock
-Bambu Studio. (The legacy Python GTK4 app was removed from the tree in t63u.)
+Bambu Studio. (The legacy Python GTK4 app has been removed from the tree.)
 
 ## What is removed
 
@@ -53,7 +53,7 @@ are deleted from the source tree, along with:
   guard, and the `tpProject`/`tpCalibration`/`tpAuxiliary` tab ids. The
   remaining tab ids (Home, Prepare, Preview, Device, Multi-device) are
   unchanged.
-- `Plater::calib_pa/flowrate/temp/max_vol_speed/retraction/VFA` and the
+- `Plater::calib_{pa,flowrate,temp,max_vol_speed,retraction,VFA}` and the
   calibration-job-finished event; the calibration-task branches in `PrintJob`.
 - `CalibUtils`: the wizard-only print paths (calibration model generation,
   auto PA/flow-ratio MQTT drivers, pre-calibration checks, `send_to_print`).
@@ -77,7 +77,6 @@ in that mode.
 
 ## Build (Linux)
 
-    source temp/env.sh          # only needed while the user-space sysroot is used
     cmake -S deps -B deps/build -G Ninja -DDESTDIR=$PWD/deps/build/destdir \
         -DDEP_WX_GTK3=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5
     cmake --build deps/build
@@ -238,8 +237,8 @@ shows only Library and Recently Opened. (Superseded: the whole web Home page is 
 ### Setup wizard deleted, native "Printers and filaments" dialog
 
 The webview setup wizard (`GuideFrame`, `WebGuideDialog.cpp/.hpp`, `resources/web/guide/{0,1,11,21,22,22_remove,24,3,31,32,5,index.html,swiper,js/home.js}`)
-and `UxProgramTermsDialog` (plus the Preferences "User Experience Improvement Program" checkbox) are removed
-(copies in `temp/removed_t55u/`). The rest of `resources/web/` went with the WebKit removal (below). Help > Setup Wizard,
+and `UxProgramTermsDialog` (plus the Preferences "User Experience Improvement Program" checkbox) are removed.
+The rest of `resources/web/` went with the WebKit removal (below). Help > Setup Wizard,
 `GUI_App::ShowUserGuide()` and `ShowOnlyFilament()` are gone.
 
 `GUI_App::run_wizard()` keeps its signature (all callers unchanged) but now opens
@@ -285,7 +284,7 @@ diameter row, EVT_NOZZLE_SELECTED on change). The real dialog needs a connected 
 UI testing `PRINTBOT_UITEST_NOZZLE_TABLE=1 ./build/src/bambu-studio` opens a sample table at startup
 (`printbot_test_nozzle_list_table`, hook in `GUI_App` startup).
 
-`resources/web/flush/` is deleted (copy in `temp/removed_t57u/`). `resources/flush/` (flush-volume predictor
+`resources/web/flush/` is deleted. `resources/flush/` (flush-volume predictor
 data used by libslic3r `FlushVolPredictor`) is unrelated and stays.
 
 Note: an app started before this change still has the old web dialog compiled in; with `flush/` deleted it
@@ -298,7 +297,7 @@ Build: `webview` dropped from `find_package(wxWidgets ...)` in `src/CMakeLists.t
 `pkg_check_modules` / `BBL_WEBKITGTK` defines and all web sources dropped from `src/slic3r/CMakeLists.txt`.
 `print_bot.sh` and `BambuStudio.cpp` no longer set `WEBKIT_DISABLE_COMPOSITING_MODE`.
 
-Deleted (copies in `temp/removed_t61u/`):
+Deleted:
 - `WebViewDialog.*` (web Home page `WebViewPanel`, `homepage3/`), `Widgets/WebView{,TraceLogger,Watcher}.*`.
 - Cloud web dialogs: `WebUserLoginDialog.*`, `ModelMall.*`, `WebDownPluginDlg.*`, `PrivacyUpdateDialog.*`,
   `MarkdownTip.*` (sidebar tooltip popups), `PrinterWebView.*` (non-Bambu printer web UI tab), the Helio and
@@ -317,14 +316,14 @@ projects (3MF thumbnail, file name, modified time; click opens it, right-click t
 It reads `MainFrame::get_recent_project_list()`; `MainFrame::m_webview` keeps its name (now `HomePanel*`) so the
 existing `SendRecentList()` refresh calls are unchanged. Opening a missing recent file asks whether to drop it.
 
-### t63u prune: everything outside the current feature set removed
+### Pruning: everything outside the current feature set removed
 
 Kept: Prepare/Preview slicer and all Bambu presets (incl. multi-nozzle H2D/H2C), native Home page, native
 Printers-and-filaments dialog, 3MF/STL/STEP/OBJ import/export, LAN discover/connect/upload/print (OBN plugin),
 the Device tab (status, controls, native AMS, camera via libBambuSource/GStreamer), native purging-volumes dialog
 and nozzle table, Preferences and translations. libslic3r is untouched apart from build fixes.
 
-Removed (copies mirrored under `temp/removed_t63u/`, pre-edit originals in `temp/backup_t63u/`):
+Removed:
 - Dead GUI/Utils files: `AmsWidgets`, `Auxiliary*`, `GUI_AuxiliaryList`, `BBLStatusBar`, `BBLStatusBarBind`,
   `ProgressStatusBar`, `BetaVersionDialog`, `GuiTextShape`, `MonitorBasePanel`, `MonitorPage`, `SliceInfoPanel`,
   `Widgets/ErrorMsgStaticText`, `Gizmos/GLGizmoFaceDetector`, `Utils/HexFile`, `Utils/Profile*`, `minilzo` +
@@ -358,13 +357,13 @@ Kept but questionable (still compiled, not reachable or not testable here):
   (Windows), the macOS STUDIO-18472 idle workaround.
 - `resources/hms` (150 MB) — Device tab HMS error texts.
 
-### t75u prune (round 2) + t84u dark-mode fix
+### Pruning (round 2) + dark-mode fix
 
 Kept on purpose (automation infrastructure for the MCP server): the CLI in
 `src/BambuStudio.cpp`, `xs/`, `t/`, `lib/`, `Build.PL`, `PRINTBOT_UITEST` hooks, action/command dispatch and the
 wx event plumbing; `resources/hms` (Device tab HMS texts); macOS/Windows sources (`*.mm`, `dark_mode.cpp`, ...).
 
-Removed (copies under `temp/removed_t75u/`, pre-edit originals in `temp/backup_t75u/`):
+Removed:
 - Root clutter: Docker/Containerfile files, `BuildFedora.sh`, sublime project, `localazy.json`, `BambuStudio.mo`,
   `diff_summary.txt`, release notes, `sandboxes/`, `bbs_test_tools/` (+ their CMake options/blocks, dead MSVC block).
 - Non-Bambu print hosts: `Utils/{PrintHost,OctoPrint,Duet,Repetier,FlashAir,AstroBox,MKS,Bonjour,TCPConsole}`,
@@ -373,7 +372,7 @@ Removed (copies under `temp/removed_t75u/`, pre-edit originals in `temp/backup_t
   `CalibrationWizardPage.*`, `CalibrateFilamentComboBox`; 44 dead cloud wrappers and 29 unused ABI structs in
   `NetworkAgent`.
 - SLA GUI: `GLGizmoSlaSupports`, `GLGizmoHollow`, `Jobs/SLAImportJob` (libslic3r SLA core stays: CLI uses it).
-- Never-linked code (found with a `--gc-sections` + map-file scratch build, `temp/t75u/notlinked.txt`): legacy
+- Never-linked code (found with a `--gc-sections` + map-file scratch build): legacy
   `ConfigWizard.cpp`/`ConfigWizard_private.hpp` (`ConfigWizard.hpp` is now just the RunReason/StartPage enums;
   `run_wizard` opens the native Printers-and-filaments dialog), `Config/Snapshot.*`, `Config/Version.cpp`,
   `SysInfoDialog`, `wxinit.h`, libslic3r `JumpPointSearch`, `PolygonTrimmer`, `SLA/bicubic.h`,
@@ -383,13 +382,12 @@ Removed (copies under `temp/removed_t75u/`, pre-edit originals in `temp/backup_t
 - 41 unreferenced images in `resources/images` (dynamic-name families such as `Nozzle_*`, `printer_preview_*`,
   `ams_humidity_*` were kept).
 
-Dark mode, Printers-and-filaments dialog (`PresetSelectionDialog`, t84u): text was dark-on-dark and the filament
+Dark mode, Printers-and-filaments dialog (`PresetSelectionDialog`): text was dark-on-dark and the filament
 checklist white in the app's dark mode, because native GTK widgets kept the system theme's colours. The
 `wxNotebook` was replaced by a themed `::Button` tab strip over a `wxSimplebook`, the `wxButton`s by `::Button`s
 with the usual StateColor recipe, and every native child (labels, checkboxes, checklist, search field, panels)
 gets explicit palette colours. The dialog follows the same dark switch as the rest of the themed UI (StateColor's
 flag) instead of re-reading `dark_color_mode`, which the GTK sys-colour handler can rewrite at runtime.
-Screenshots: `temp/t84u/` (dark with GTK light theme, dark with GTK dark theme, light).
 
 Testing note: OBN's `appcert_fetch` is on by default even in the LAN-only build; a fresh config fetches the
 shared slicer app cert from api.bambulab.com and the plugin then sends `app_cert_install` to a LAN printer it

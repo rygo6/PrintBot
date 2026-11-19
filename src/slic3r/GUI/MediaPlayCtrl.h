@@ -75,20 +75,19 @@ private:
 
 
 private:
-    static const wxMediaState MEDIASTATE_IDLE = (wxMediaState) 3;
-    // The states below extend wxMediaState beyond its declared range [0, 3].
-    // Converting an out-of-range integer to the enum is ill-formed in a constant
-    // expression (a hard error on Clang / Xcode 26+ that no -Wno- flag can silence),
-    // so these must not be constexpr/const - keep them as runtime-initialized values.
-    static inline wxMediaState MEDIASTATE_INITIALIZING = (wxMediaState) 4;
-    static inline wxMediaState MEDIASTATE_LOADING = (wxMediaState) 5;
-    static inline wxMediaState MEDIASTATE_BUFFERING = (wxMediaState) 6;
+    // The states below extend wxMediaState beyond its declared range [0, 3]. Holding them in a
+    // wxMediaState is undefined behaviour, so the extended state is kept as a plain int
+    // (wxMEDIASTATE_STOPPED / PAUSED / PLAYING compare as their int values).
+    static constexpr int MEDIASTATE_IDLE         = 3;
+    static constexpr int MEDIASTATE_INITIALIZING = 4;
+    static constexpr int MEDIASTATE_LOADING      = 5;
+    static constexpr int MEDIASTATE_BUFFERING    = 6;
 
     // token
     std::shared_ptr<int> m_token = std::make_shared<int>(0);
 
     wxMediaCtrl3 * m_media_ctrl;
-    wxMediaState m_last_state = MEDIASTATE_IDLE;
+    int          m_last_state = MEDIASTATE_IDLE;
     MachineObject* m_obj = nullptr;
     std::string m_machine;
     int m_lan_proto = 0;

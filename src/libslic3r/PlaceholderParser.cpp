@@ -211,6 +211,8 @@ namespace client
 
         expr &operator=(const expr &rhs)
         {
+            if (this == &rhs)
+                return *this;
             //BBS: avoid memory leak when call operator= directly before call reset()
             if (this->type == TYPE_STRING && this->data.s) {
                 delete this->data.s;
@@ -228,6 +230,10 @@ namespace client
 
         expr &operator=(expr &&rhs)
         {
+            if (this == &rhs)
+                return *this;
+            // Free our own string first, otherwise it leaks when overwritten.
+            this->reset();
             type            = rhs.type;
             this->it_range  = rhs.it_range;
             data.set(rhs.data);
@@ -545,6 +551,7 @@ namespace client
                 boost::throw_exception(qi::expectation_failure<Iterator>(
                     lhs.it_range.begin(), rhs.it_range.end(), spirit::info("*Cannot compare the types.")));
             }
+            lhs.reset(); // lhs may hold a heap string (string comparison); free it before it becomes a bool
             lhs.type = TYPE_BOOL;
             lhs.data.b = invert ? ! value : value;
         }

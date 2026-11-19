@@ -855,7 +855,7 @@ void MeshBooleanUI::draw_object_list(const std::string& table_name, ImVec2 size,
     ImGui::SetCursorPos(ImVec2(start_pos.x - ImGui::GetWindowPos().x,
                                start_pos.y - ImGui::GetWindowPos().y));
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(0, 0, 0, 255));
-    ImGui::Text(title.c_str());
+    ImGui::TextUnformatted(title.c_str());
 
     // Draw count text (smaller size) with some spacing
     ImGui::SameLine(0, MeshBooleanConfig::SPACING_LIST_TITLE); // Add 4 pixels spacing between title and count
@@ -1280,7 +1280,7 @@ void MeshBooleanUI::draw_progress_bar()
     // Draw percentage text on the same line
     ImGui::SameLine(0, text_padding);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(ImVec4(0.42f, 0.42f, 0.42f, 1.00f), progress_text.c_str());
+    ImGui::TextColored(ImVec4(0.42f, 0.42f, 0.42f, 1.00f), "%s", progress_text.c_str());
 
     ImGui::EndGroup();
 
@@ -1299,7 +1299,7 @@ void MeshBooleanUI::draw_progress_bar()
         status_text = _u8L("Applying result..");
     }
 
-    ImGui::TextColored(text_color, status_text.c_str());
+    ImGui::TextColored(text_color, "%s", status_text.c_str());
 
     ImGui::Spacing();
 }

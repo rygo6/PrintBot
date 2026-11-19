@@ -5,6 +5,7 @@
 #include <wx/image.h>
 #include <wx/statbmp.h>
 #include <wx/timer.h>
+#include <wx/statline.h>
 #include <slic3r/GUI/Widgets/Button.hpp>
 #include "Widgets/ProgressBar.hpp"
 #include <slic3r/GUI/DeviceManager.hpp>

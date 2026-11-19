@@ -1,7 +1,7 @@
 #ifndef slic3r_ConfigWizard_hpp_
 #define slic3r_ConfigWizard_hpp_
 
-// print_bot: the legacy ConfigWizard dialog was removed (t75u). Only the
+// print_bot: the legacy ConfigWizard dialog was removed. Only the
 // reason/start-page enums survive; GUI_App::run_wizard() opens the native
 // "Printers and filaments" dialog.
 

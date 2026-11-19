@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include <boost/filesystem.hpp>
 #include <boost/nowide/args.hpp>
@@ -168,18 +170,14 @@ int main(int argc, char **argv)
         if (socket_path.empty()) socket_path = mcp::default_socket_path();
         int sock = mcp::connect_socket(socket_path);
         for (int i = 0; sock < 0 && want == Want::Gui && i < int(wait_s * 4); ++i) {
-#ifndef _WIN32
-            usleep(250000);
-#endif
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
             sock = mcp::connect_socket(socket_path);
         }
         if (sock >= 0) {
             std::fprintf(stderr, "print_bot-mcp %s: live mode, bridging to the running print_bot app (%s)\n", PRINTBOT_CORE_VERSION, socket_path.c_str());
             std::fflush(proto);
             int rc = mcp::bridge_stdio(sock, 0, fileno(proto));
-#ifndef _WIN32
-            close(sock);
-#endif
+            mcp::close_socket(sock);
             return rc;
         }
         if (want == Want::Gui) {

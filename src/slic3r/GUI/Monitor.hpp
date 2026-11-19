@@ -78,19 +78,19 @@ private:
     Tabbook*		m_tabpanel{ nullptr };
     wxSizer*        m_main_sizer{ nullptr };
 
-    AddMachinePanel*    m_status_add_machine_panel;
-    StatusPanel*        m_status_info_panel;
-    MediaFilePanel*     m_media_file_panel;
-    UpgradePanel*       m_upgrade_panel;
-    HMSPanel*           m_hms_panel;
+    AddMachinePanel*    m_status_add_machine_panel{nullptr};
+    StatusPanel*        m_status_info_panel{nullptr};
+    MediaFilePanel*     m_media_file_panel{nullptr};
+    UpgradePanel*       m_upgrade_panel{nullptr};
+    HMSPanel*           m_hms_panel{nullptr};
 
 	/* side tools */
     SideTools*      m_side_tools{nullptr};
-    wxStaticBitmap* m_bitmap_printer_type;
-    wxStaticBitmap* m_bitmap_arrow;
-    wxStaticText*   m_staticText_printer_name;
-    wxStaticBitmap* m_bitmap_wifi_signal;
-    wxBoxSizer *    m_side_tools_sizer;
+    wxStaticBitmap* m_bitmap_printer_type{nullptr};
+    wxStaticBitmap* m_bitmap_arrow{nullptr};
+    wxStaticText*   m_staticText_printer_name{nullptr};
+    wxStaticBitmap* m_bitmap_wifi_signal{nullptr};
+    wxBoxSizer *    m_side_tools_sizer{nullptr};
     SelectMachinePopup m_select_machine;
 
 	/* images */

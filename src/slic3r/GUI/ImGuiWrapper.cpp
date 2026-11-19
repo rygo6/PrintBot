@@ -930,10 +930,17 @@ bool ImGuiWrapper::bbl_button(const wxString &label)
     return ImGui::BBLButton(label_utf8.c_str());
 }
 
+// Sizes computed from a degenerate (tiny/zero) window can be NaN or astronomically large; ImGui casts them to int.
+static float sane_button_extent(float v)
+{
+    if (!std::isfinite(v) || v < 0.f) return 0.f; // 0 = let ImGui size it from the label
+    return std::min(v, 100000.f);
+}
+
 bool ImGuiWrapper::button(const wxString& label, float width, float height)
 {
     auto label_utf8 = into_u8(label);
-    return ImGui::Button(label_utf8.c_str(), ImVec2(width, height));
+    return ImGui::Button(label_utf8.c_str(), ImVec2(sane_button_extent(width), sane_button_extent(height)));
 }
 
 bool ImGuiWrapper::button(const wxString &label, const ImVec2 &size, bool enable)
@@ -941,7 +948,7 @@ bool ImGuiWrapper::button(const wxString &label, const ImVec2 &size, bool enable
     disabled_begin(!enable);
 
     auto label_utf8 = into_u8(label);
-    bool res        = ImGui::Button(label_utf8.c_str(), size);
+    bool res        = ImGui::Button(label_utf8.c_str(), ImVec2(sane_button_extent(size.x), sane_button_extent(size.y)));
 
     disabled_end();
     return (enable) ? res : false;

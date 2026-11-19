@@ -20,6 +20,7 @@ class DailyTipsPanel {
     static int uid;
 public:
     DailyTipsPanel(bool can_expand = true, DailyTipsLayout layout = DailyTipsLayout::Vertical);
+    ~DailyTipsPanel(); // out of line: DailyTipsDataRenderer is incomplete here
     void set_position(const ImVec2& pos);
     void set_size(const ImVec2& size);
     void set_can_expand(bool can_expand);

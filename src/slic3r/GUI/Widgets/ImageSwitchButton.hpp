@@ -38,8 +38,8 @@ private:
 private:
     ScalableBitmap m_on;
     ScalableBitmap m_off;
-    bool           m_on_off;
-	int            m_padding;	// size between icon and text
+    bool           m_on_off{false};
+	int            m_padding{0};	// size between icon and text
     bool           pressedDown = false;
 	bool		   hover = false;
 
@@ -84,14 +84,14 @@ private:
 private:
     ScalableBitmap m_on;
     ScalableBitmap m_off;
-    bool           m_on_off;
-    int            m_padding;	// size between icon and text
+    bool           m_on_off{false};
+    int            m_padding{0};	// size between icon and text
     bool           pressedDown = false;
     bool		   hover = false;
 
     wxSize	     textSize;
     wxSize       minSize;
-    int          m_speed;
+    int          m_speed{0};
 
     wxString labels[2];
 

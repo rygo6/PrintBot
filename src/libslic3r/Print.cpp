@@ -1,5 +1,6 @@
 #include "Exception.hpp"
 #include "Print.hpp"
+#include <cmath>
 #include "BoundingBox.hpp"
 #include "Brim.hpp"
 #include "ClipperUtils.hpp"
@@ -1320,6 +1321,58 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
 
     if (m_objects.empty())
         return {std::string()};
+
+    // Slicing uses 32-bit scaled coordinates (about +-21 m); geometry far beyond any bed (e.g. a scale or position
+    // typed as 1e10) overflows the polygon clipper. Refuse it with a clear message instead of slicing garbage.
+    {
+        constexpr double max_abs_coord_mm = 5000.;
+        for (const PrintObject *po : m_objects) {
+            const ModelObject *mo = po->model_object();
+            for (size_t i = 0; i < mo->instances.size(); ++i) {
+                const BoundingBoxf3 bb = mo->instance_bounding_box(i);
+                if (!bb.defined) continue;
+                const bool bad = !bb.min.allFinite() || !bb.max.allFinite() ||
+                                 bb.min.cwiseAbs().maxCoeff() > max_abs_coord_mm || bb.max.cwiseAbs().maxCoeff() > max_abs_coord_mm;
+                if (bad)
+                    return { L("An object is too large or too far from the plate to be sliced. Check its size, scale and position."), po->model_object() };
+            }
+        }
+    }
+
+    // Length / percent settings without a declared maximum (e.g. a typed 999999 mm compensation or shell value) push
+    // geometry outside the clipper's 32-bit range. Reject absurd magnitudes before slicing.
+    {
+        auto absurd_key = [](const ConfigBase &cfg) -> std::string {
+            for (const std::string &key : cfg.keys()) {
+                const ConfigOptionDef *def = cfg.def() ? cfg.def()->get(key) : nullptr;
+                const ConfigOption    *opt = cfg.option(key);
+                if (def == nullptr || opt == nullptr) continue;
+                const bool is_mm  = def->sidetext == "mm" || def->sidetext.rfind("mm or", 0) == 0;
+                const bool is_pct = def->sidetext == "%";
+                if (!is_mm && !is_pct) continue;
+                auto bad = [](double v, bool pct) { return !std::isfinite(v) || std::abs(v) > (pct ? 100000. : 5000.); };
+                switch (opt->type()) {
+                case coFloat: if (bad(static_cast<const ConfigOptionFloat*>(opt)->value, is_pct)) return key; break;
+                case coPercent: if (bad(static_cast<const ConfigOptionPercent*>(opt)->value, true)) return key; break;
+                case coFloatOrPercent: {
+                    auto *o = static_cast<const ConfigOptionFloatOrPercent*>(opt);
+                    if (bad(o->value, o->percent)) return key;
+                    break; }
+                case coFloats: for (double v : static_cast<const ConfigOptionFloats*>(opt)->values) if (bad(v, is_pct)) return key; break;
+                case coPercents: for (double v : static_cast<const ConfigOptionPercents*>(opt)->values) if (bad(v, true)) return key; break;
+                default: break;
+                }
+            }
+            return {};
+        };
+        for (const PrintObject *po : m_objects) {
+            std::string key = absurd_key(po->config());
+            for (const PrintRegion &region : po->all_regions())
+                if (key.empty()) key = absurd_key(region.config());
+            if (!key.empty())
+                return { L("A setting has a value far outside its usable range. Please check it."), po, key };
+        }
+    }
 
     if (extruders.empty())
         return { L("No extrusions under current settings.") };

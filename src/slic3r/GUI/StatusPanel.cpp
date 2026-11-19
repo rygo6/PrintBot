@@ -1024,10 +1024,6 @@ void PrintingTaskPanel::create_panel(wxWindow *parent)
         Layout();
     });
 
-    wxBoxSizer *bSizer_task_btn = new wxBoxSizer(wxHORIZONTAL);
-
-    bSizer_task_btn->Add(FromDIP(10), 0, 0);
-
     StateColor white_bg(std::pair<wxColour, int>(wxColour(255, 255, 255), StateColor::Disabled), std::pair<wxColour, int>(wxColour(255, 255, 255), StateColor::Pressed),
                         std::pair<wxColour, int>(wxColour(255, 255, 255), StateColor::Hovered), std::pair<wxColour, int>(wxColour(255, 255, 255), StateColor::Enabled),
                         std::pair<wxColour, int>(wxColour(255, 255, 255), StateColor::Normal));
@@ -1077,7 +1073,6 @@ void PrintingTaskPanel::create_panel(wxWindow *parent)
 
     m_button_abort->Bind(wxEVT_LEAVE_WINDOW, [this](auto &e) { m_button_abort->SetBitmap_("print_control_stop"); });
 
-    wxBoxSizer *bSizer_buttons     = new wxBoxSizer(wxHORIZONTAL);
     wxBoxSizer *bSizer_text        = new wxBoxSizer(wxHORIZONTAL);
     wxBoxSizer *bSizer_finish_time = new wxBoxSizer(wxHORIZONTAL);
     wxPanel    *penel_text         = new wxPanel(progress_lr_panel);

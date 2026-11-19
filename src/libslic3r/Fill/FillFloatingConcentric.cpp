@@ -82,7 +82,8 @@ static ExtrusionPaths floating_thick_polyline_to_extrusion_paths(const FloatingT
         };
 
     for (int i = 0; i < (int)lines.size(); ++i) {
-        const FloatingThickline& line = lines[i];
+        // A copy, not a reference: the loop erases and inserts into `lines` below.
+        const FloatingThickline line = lines[i];
 
         if (i == 0) {
             max_width = min_width = line.a_width;
@@ -695,7 +696,9 @@ FloatingThickPolylines FillFloatingConcentric::resplit_order_loops(Point curr_po
 
             EdgeGrid::Grid grid;
             grid.set_bbox(bbox_line);
-            grid.create({ polyline.points }, scaled<coord_t>(10.), !all_extrusions[idx]->is_closed);
+            // EdgeGrid keeps pointers into the contour storage: it must outlive the grid.
+            const std::vector<Points> grid_contours{ polyline.points };
+            grid.create(grid_contours, scaled<coord_t>(10.), !all_extrusions[idx]->is_closed);
             if (grid.has_intersecting_edges())
                 is_self_intersect = true;
         }

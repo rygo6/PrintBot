@@ -318,6 +318,10 @@ bool PrusaFileParser::check_3mf_from_prusa(const std::string filename)
     }
 
 EXIT:
+    if (m_parser != nullptr) {
+        XML_ParserFree(m_parser);
+        m_parser = nullptr;
+    }
     close_zip_reader(&archive);
     return m_from_prusa;
 }

@@ -327,6 +327,8 @@ set(_dep_list
     )
 
 if (MSVC)
+    # The app links GLEW; Windows has no system copy to fall back on.
+    list(APPEND _dep_list "dep_GLEW")
     # Experimental
     #list(APPEND _dep_list "dep_qhull")
 else()

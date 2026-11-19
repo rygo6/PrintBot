@@ -8289,89 +8289,6 @@ BoundingBox Plater::priv::scaled_bed_shape_bb() const
     return printable_area.bounding_box();
 }
 
-
-void read_binary_stl(const std::string& filename, std::string& model_id, std::string& code,
-    std::string& ml_name, std::string& ml_region, std::string& ml_id) {
-    std::ifstream file( encode_path(filename.c_str()), std::ios::binary);
-    if (!file) {
-        return;
-    }
-
-    try {
-        // Read the first 80 bytes
-        char data[80];
-        file.read(data, 80);
-        if (!file) {
-            file.close();
-            return;
-        }
-
-        if (data[0] == '\0' || data[0] == ' ') {
-            file.close();
-            return;
-        }
-
-        /*include ml info*/
-        std::string ext_content(data);
-        std::string ml_content;
-        std::string mw_content;
-
-        size_t pos = ext_content.find('&');
-        if (pos != std::string::npos) {
-            mw_content = ext_content.substr(0, pos);
-            ml_content = ext_content.substr(pos + 1);
-        }
-
-        if (ml_content.empty() && ext_content.find("ML") != std::string::npos) {
-            ml_content = ext_content;
-        }
-
-        if (mw_content.empty() && ext_content.find("MW") != std::string::npos) {
-            mw_content = ext_content;
-        }
-
-        /*parse ml info*/
-        if (!ml_content.empty()) {
-            std::istringstream iss(ml_content);
-            std::string token;
-            std::vector<std::string> result;
-            while (iss >> token) {
-                if (token.find(' ') == std::string::npos) {
-                    result.push_back(token);
-                }
-            }
-
-            if (result.size() == 4 && result[0] == "ML") {
-                ml_region   = result[1];
-                ml_name     = result[2];
-                ml_id       = result[3];
-            }
-        }
-
-        /*parse mw info*/
-        if (!mw_content.empty()) {
-            std::istringstream iss(mw_content);
-            std::string token;
-            std::vector<std::string> result;
-            while (iss >> token) {
-                if (token.find(' ') == std::string::npos) {
-                    result.push_back(token);
-                }
-            }
-
-            if (result.size() == 4 && result[0] == "MW") {
-                model_id    = result[2];
-                code        = result[3];
-            }
-        }
-
-        file.close();
-    }
-    catch (...) {
-    }
-    return;
-}
-
 // BBS: backup & restore
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi)
 {
@@ -8510,6 +8427,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     PlateDataPtrs             plate_data;
                     ConfigSubstitutionContext config_substitutions{ForwardCompatibilitySubstitutionRule::Enable};
                     std::vector<Preset *>     project_presets;
+                    // Free whatever the importer handed back on every exit path (throw / early return / no-config load).
+                    ScopeGuard free_import_results([&plate_data, &project_presets]() {
+                        release_PlateData_list(plate_data);
+                        for (Preset *preset : project_presets) delete preset;
+                        project_presets.clear();
+                    });
                     // BBS: backup & restore
                     q->skip_thumbnail_invalid = true;
                     // Used to store color group mapping information in standard 3MF files
@@ -9206,10 +9129,6 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             cancel        = !cont;
                     },
                     nullptr, 0, obj_color_fun);
-                }
-
-                if (designer_model_id.empty() && boost::algorithm::iends_with(path.string(), ".stl")) {
-                    read_binary_stl(path.string(), designer_model_id, designer_country_code, makerlab_name, makerlab_region, makerlab_id);
                 }
 
                 if (type_any_amf && is_xxx) imperial_units = true;
@@ -13994,8 +13913,9 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
     const bool                old_prime_tower_enabled = old_full_config.opt_bool("enable_prime_tower");
     // Smooth-mode timelapse needs a wipe tower even for a single-filament plate, so it
     // must gate the snapshot/translate logic the same way filament_cnt>1 does.
-    const auto old_timelapse_smooth = []() -> bool {
-        if (auto *opt = wxGetApp().preset_bundle->full_config().option<ConfigOptionEnum<TimelapseType>>("timelapse_type"))
+    // Read from old_full_config: an option pointer into a temporary full_config() would dangle.
+    const bool old_timelapse_smooth = [&old_full_config]() -> bool {
+        if (auto *opt = old_full_config.option<ConfigOptionEnum<TimelapseType>>("timelapse_type"))
             return opt->value == TimelapseType::tlSmooth;
         return false;
     }();
@@ -14170,8 +14090,8 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
     const DynamicPrintConfig &new_full_config_for_wt = wxGetApp().preset_bundle->full_config();
     const int new_nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
     const bool new_prime_tower_enabled = new_full_config_for_wt.opt_bool("enable_prime_tower");
-    const bool new_timelapse_smooth = []() -> bool {
-        if (auto *opt = wxGetApp().preset_bundle->full_config().option<ConfigOptionEnum<TimelapseType>>("timelapse_type"))
+    const bool new_timelapse_smooth = [&new_full_config_for_wt]() -> bool {
+        if (auto *opt = new_full_config_for_wt.option<ConfigOptionEnum<TimelapseType>>("timelapse_type"))
             return opt->value == TimelapseType::tlSmooth;
         return false;
     }();
@@ -17353,8 +17273,10 @@ void Sidebar::set_btn_label(const ActionButtonType btn_type, const wxString& lab
 
 Plater::Plater(wxWindow *parent, MainFrame *main_frame)
     : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxGetApp().get_min_size())
-    , p(new priv(this, main_frame))
 {
+    // Create priv in the body, not the init list: its c-tor calls back into Plater (only_gcode_mode()
+    // and other flags), which must already be initialized (p is declared before them).
+    p.reset(new priv(this, main_frame));
     // Initialization performed in the private c-tor
     enable_wireframe(true);
 }
@@ -18214,6 +18136,7 @@ ProjectDropDialog::ProjectDropDialog(const std::string &filename)
                 wxDefaultSize,
                 wxCAPTION | wxCLOSE_BOX)
 {
+    m_radio_group.DeleteContents(true); // the list owns its RadioSelector entries
     // def setting
     SetBackgroundColour(m_def_color);
 
@@ -23468,7 +23391,7 @@ void Plater::show_object_info()
         t = model_object->instances[inst_idx]->get_matrix() * vol->get_matrix();
         info_text += (boost::format(_utf8(L("Part name: %1%\n"))) % vol->name).str();
         face_count = static_cast<int>(vol->mesh().facets_count());
-        if (&vol->get_convex_hull()) {
+        if (!vol->get_convex_hull().empty()) {
             size = vol->get_convex_hull().transformed_bounding_box(t).size();
         }
     }

@@ -35,6 +35,7 @@ class KBShortcutsDialog : public DPIDialog
 
 public:
     KBShortcutsDialog();
+    ~KBShortcutsDialog() override { for (auto &kv : m_hash_selector) delete kv.second; m_hash_selector.clear(); }
     wxWindow* create_button(int id, wxString text);
     void          OnSelectTabel(wxCommandEvent &event);
     wxPanel *m_panel_selects;

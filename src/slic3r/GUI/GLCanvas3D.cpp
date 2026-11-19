@@ -9195,7 +9195,9 @@ void GLCanvas3D::_render_gcode(int canvas_width, int canvas_height)
 
     if (moves_slider->is_dirty()) {
         moves_slider->set_as_dirty(false);
-        t_gcode_viewer.update_sequential_view_current((moves_slider->GetLowerValueD() - 1.0), static_cast<unsigned int>(moves_slider->GetHigherValueD() - 1.0));
+        // Slider values are 1-based; an empty/reset slider reports 0, which must not wrap to UINT_MAX (float->unsigned UB).
+        t_gcode_viewer.update_sequential_view_current(static_cast<unsigned int>(std::max(0.0, moves_slider->GetLowerValueD() - 1.0)),
+                                                      static_cast<unsigned int>(std::max(0.0, moves_slider->GetHigherValueD() - 1.0)));
         post_event(SimpleEvent(EVT_GLCANVAS_UPDATE));
         t_gcode_viewer.update_marker_curr_move();
     }
@@ -10912,9 +10914,9 @@ void GLCanvas3D::_render_assemble_info() const
     double size1 = m_selection.get_bounding_box().size()(1);
     double size2 = m_selection.get_bounding_box().size()(2);
     if (!m_selection.is_empty()) {
-        ImGui::Text(_L("Volume:").ToUTF8()); ImGui::SameLine(caption_max);
+        ImGui::TextUnformatted(_L("Volume:").ToUTF8()); ImGui::SameLine(caption_max);
         ImGui::Text("%.2f", size0 * size1 * size2);
-        ImGui::Text(_L("Size:").ToUTF8()); ImGui::SameLine(caption_max);
+        ImGui::TextUnformatted(_L("Size:").ToUTF8()); ImGui::SameLine(caption_max);
         ImGui::Text("%.2f x %.2f x %.2f", size0, size1, size2);
     }
     imgui->end();
@@ -12739,6 +12741,15 @@ void GLCanvas3D::_check_assembly_far_from_origin()
     }
 }
 
+// tinybvh casts box coordinates to integers while binning; NaN / inf boxes (degenerate geometry)
+// make that undefined, so such sets are not handed to it.
+static bool _bvh_aabbs_finite(const std::vector<tinybvh::bvhvec4>& aabbs)
+{
+    for (const tinybvh::bvhvec4& v : aabbs)
+        if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) return false;
+    return true;
+}
+
 static void _collect_bvh_subtree_prims(const tinybvh::BVH& bvh, uint32_t node_idx, std::vector<uint32_t>& prim_indices)
 {
     const tinybvh::BVH::BVHNode& node = bvh.bvhNode[node_idx];
@@ -12955,6 +12966,7 @@ static void _reclaim_isolated_volumes_by_bvh(
             iso_aabbs.emplace_back((float) eb.max.x(), (float) eb.max.y(), (float) eb.max.z(), 0.0f);
         }
 
+        if (!_bvh_aabbs_finite(iso_aabbs)) break;
         tinybvh::BVH iso_bvh;
         iso_bvh.BuildAABB(iso_aabbs.data(), (uint32_t) (1 + iso_count));
 
@@ -13043,6 +13055,7 @@ void GLCanvas3D::_filter_assembly_thumbnail_candidates_by_bvh(const std::vector<
         volume_aabbs.emplace_back((float)box.max.x(), (float)box.max.y(), (float)box.max.z(), 0.0f);
     }
 
+    if (!_bvh_aabbs_finite(volume_aabbs)) return;
     tinybvh::BVH volume_bvh;
     volume_bvh.BuildAABB(volume_aabbs.data(), (uint32_t)assemble_candidate_volumes.size());
 

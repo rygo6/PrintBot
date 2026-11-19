@@ -29,11 +29,11 @@ ImageMessageDialog::ImageMessageDialog(wxWindow *parent, wxWindowID id, const wx
     int target_w = FromDIP(380);
     int target_h = FromDIP(270);
     std::string image_path = (boost::format("%1%/images/clumping.png") % resources_dir()).str();
-    wxImage* image = new wxImage(image_path, wxBITMAP_TYPE_PNG);
-    if (image && image->IsOk()) {
-        *image = image->Scale(target_w, target_h, wxIMAGE_QUALITY_HIGH);
+    wxImage  image(image_path, wxBITMAP_TYPE_PNG); // was a leaked heap wxImage
+    if (image.IsOk()) {
+        image = image.Scale(target_w, target_h, wxIMAGE_QUALITY_HIGH);
     }
-    wxBitmap bitmap   = wxBitmap(*image);
+    wxBitmap bitmap   = wxBitmap(image);
     m_error_msg_label = new Label(m_scroll_area, message, LB_AUTO_WRAP);
     m_error_picture   = new wxStaticBitmap(m_scroll_area, wxID_ANY, bitmap, wxDefaultPosition, wxSize(target_w, target_h));
 

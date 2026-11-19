@@ -64,7 +64,7 @@ public:
 
     static void         clearGlobalLog() { global_log.seekp(0); }
     static bool         emptyGlobalLog() { return global_log.tellp()<=0; }
-    static const char  *stringGlobalLog() { return global_log.str().c_str(); }
+    static const char  *stringGlobalLog() { static std::string s; s = global_log.str(); return s.c_str(); } // print_bot: was c_str() of a temporary
 
 #//!\name Virtual
     virtual const char *what() const throw();

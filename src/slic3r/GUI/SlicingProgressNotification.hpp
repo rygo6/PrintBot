@@ -1,6 +1,7 @@
 #ifndef slic3r_GUI_SlicingProgressNotification_hpp_
 #define slic3r_GUI_SlicingProgressNotification_hpp_
 
+#include <memory>
 #include "DailyTips.hpp"
 #include "NotificationManager.hpp"
 
@@ -23,12 +24,12 @@ public:
     SlicingProgressNotification(const NotificationData& n, NotificationIDProvider& id_provider, wxEvtHandler* evt_handler, std::function<bool()> callback)
         : PopNotification(n, id_provider, evt_handler)
         , m_cancel_callback(callback)
-        , m_dailytips_panel(new DailyTipsPanel(true, DailyTipsLayout::Vertical))
+        , m_dailytips_panel(std::make_unique<DailyTipsPanel>(true, DailyTipsLayout::Vertical))
     {
         set_progress_state(SlicingProgressState::SP_NO_SLICING);
     }
     void                set_percentage(float percent) { m_percentage = percent; }
-    DailyTipsPanel*     get_dailytips_panel() { return m_dailytips_panel; }
+    DailyTipsPanel*     get_dailytips_panel() { return m_dailytips_panel.get(); }
     SlicingProgressState get_progress_state() { return m_sp_state; }
     // sets text of notification - call after setting progress state
     void				set_status_text(const std::string& text);
@@ -74,7 +75,7 @@ protected:
     bool                    m_sidebar_collapsed{ false };
     // if true, it is possible show export hyperlink in state SP_PROGRESS
     bool                    m_export_possible{ false };
-    DailyTipsPanel*         m_dailytips_panel{ nullptr };
+    std::unique_ptr<DailyTipsPanel> m_dailytips_panel;
 
     /* currently not used */
     bool				    m_has_print_info{ false };

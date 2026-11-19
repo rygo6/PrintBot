@@ -1,5 +1,6 @@
 #include "../libslic3r.h"
 #include "../Exception.hpp"
+#include <exception>
 #include "../Model.hpp"
 #include "../Preset.hpp"
 #include "../Utils.hpp"
@@ -1500,6 +1501,16 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         static void XMLCALL _handle_end_config_xml_element(void* userData, const char* name);
     };
 
+    // A plate started in model_settings.config but not yet handed to m_plater_data is owned by the importer.
+    static void discard_unowned_plate(PlateData *&plate, const std::map<int, PlateData*> &owned)
+    {
+        if (plate == nullptr) return;
+        for (const auto &kv : owned)
+            if (kv.second == plate) { plate = nullptr; return; }
+        delete plate;
+        plate = nullptr;
+    }
+
     _BBS_3MF_Importer::_BBS_3MF_Importer()
         : m_version(0)
         , m_check_version(false)
@@ -1530,6 +1541,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         m_curr_metadata_name.clear();
         m_curr_characters.clear();
 
+        discard_unowned_plate(m_curr_plater, m_plater_data); // parsing stopped inside a <plate>
         std::map<int, PlateData*>::iterator it = m_plater_data.begin();
         while (it != m_plater_data.end())
         {
@@ -2744,6 +2756,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             XML_Parser& parser;
             _BBS_3MF_Importer& importer;
             const mz_zip_archive_file_stat& stat;
+            // Exceptions must not unwind through miniz (C code): it would leak its read buffer.
+            std::exception_ptr error;
 
             CallbackData(XML_Parser& parser, _BBS_3MF_Importer& importer, const mz_zip_archive_file_stat& stat) : parser(parser), importer(importer), stat(stat) {}
         };
@@ -2756,15 +2770,22 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         {
             mz_file_write_func callback = [](void* pOpaque, mz_uint64 file_ofs, const void* pBuf, size_t n)->size_t {
                 CallbackData* data = (CallbackData*)pOpaque;
+                try {
                 if (!XML_Parse(data->parser, (const char*)pBuf, (int)n, (file_ofs + n == data->stat.m_uncomp_size) ? 1 : 0) || data->importer.parse_error()) {
                     char error_buf[1024];
                     ::snprintf(error_buf, 1024, "Error (%s) while parsing '%s' at line %d", data->importer.parse_error_message(), data->stat.m_filename, (int)XML_GetCurrentLineNumber(data->parser));
                     throw Slic3r::FileIOError(error_buf);
                 }
+                } catch (...) {
+                    data->error = std::current_exception();
+                    return 0; // makes miniz stop and clean up
+                }
                 return n;
             };
             void* opaque = &data;
             res = mz_zip_reader_extract_to_callback(&archive, stat.m_file_index, callback, opaque, 0);
+            if (data.error)
+                std::rethrow_exception(data.error);
         }
         catch (const version_error& e)
         {
@@ -5066,6 +5087,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::_handle_start_config_plater(const char** attributes, unsigned int num_attributes)
     {
         if (!m_parsing_slice_info) {
+            discard_unowned_plate(m_curr_plater, m_plater_data); // unbalanced <plate> in a malformed file
             m_curr_plater = new PlateData();
         }
 
@@ -5079,7 +5101,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             add_error("_handle_end_config_plater: don't find plate created before");
             return false;
         }
-        m_plater_data.emplace(m_curr_plater->plate_index, m_curr_plater);
+        // Duplicate plate index: the first one wins, as before. Free the loser unless it is already owned
+        // (m_curr_plater can point at an entry of m_plater_data in a malformed file).
+        if (!m_plater_data.emplace(m_curr_plater->plate_index, m_curr_plater).second)
+            discard_unowned_plate(m_curr_plater, m_plater_data);
         m_curr_plater = nullptr;
         return true;
     }
@@ -6264,6 +6289,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             XML_Parser& parser;
             _BBS_3MF_Importer::ObjectImporter& importer;
             const mz_zip_archive_file_stat& stat;
+            // Exceptions must not unwind through miniz (C code): it would leak its read buffer.
+            std::exception_ptr error;
 
             CallbackData(XML_Parser& parser, _BBS_3MF_Importer::ObjectImporter& importer, const mz_zip_archive_file_stat& stat) : parser(parser), importer(importer), stat(stat) {}
         };
@@ -6276,15 +6303,22 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         {
             mz_file_write_func callback = [](void* pOpaque, mz_uint64 file_ofs, const void* pBuf, size_t n)->size_t {
                 CallbackData* data = (CallbackData*)pOpaque;
+                try {
                 if (!XML_Parse(data->parser, (const char*)pBuf, (int)n, (file_ofs + n == data->stat.m_uncomp_size) ? 1 : 0) || data->importer.object_parse_error()) {
                     char error_buf[1024];
                     ::snprintf(error_buf, 1024, "Error (%s) while parsing '%s' at line %d", data->importer.object_parse_error_message(), data->stat.m_filename, (int)XML_GetCurrentLineNumber(data->parser));
                     throw Slic3r::FileIOError(error_buf);
                 }
+                } catch (...) {
+                    data->error = std::current_exception();
+                    return 0; // makes miniz stop and clean up
+                }
                 return n;
             };
             void* opaque = &data;
             res = mz_zip_reader_extract_to_callback(&archive, stat.m_file_index, callback, opaque, 0);
+            if (data.error)
+                std::rethrow_exception(data.error);
         }
         catch (const version_error& e)
         {
@@ -7587,16 +7621,20 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     CNumericLocalesSetter locales_setter;
                     _add_model_file_to_archive(object_paths[i], archive, model, objects_data2, nullptr, project);
                     iter->second = objects_data2.begin()->second;
-                    void *ppBuf; size_t pSize;
-                    mz_zip_writer_finalize_heap_archive(&archive, &ppBuf, &pSize);
+                    void *ppBuf = nullptr; size_t pSize = 0;
+                    const bool finalized = mz_zip_writer_finalize_heap_archive(&archive, &ppBuf, &pSize);
                     mz_zip_writer_end(&archive);
                     mz_zip_zero_struct(&archive);
-                    mz_zip_reader_init_mem(&archive, ppBuf, pSize, 0);
-                    {
-                        boost::unique_lock l(mutex);
-                        mz_zip_writer_add_from_zip_reader(main, &archive, 0);
+                    if (finalized && ppBuf != nullptr) {
+                        mz_zip_reader_init_mem(&archive, ppBuf, pSize, 0);
+                        {
+                            boost::unique_lock l(mutex);
+                            mz_zip_writer_add_from_zip_reader(main, &archive, 0);
+                        }
+                        mz_zip_reader_end(&archive);
                     }
-                    mz_zip_reader_end(&archive);
+                    // finalize_heap_archive hands the buffer to us; the reader does not own it (was leaked, >=1 MB per object).
+                    mz_free(ppBuf);
                 }
             });
         }
@@ -9703,6 +9741,21 @@ bool load_bbs_3mf(const char* path, DynamicPrintConfig* config, ConfigSubstituti
     // All import should use "C" locales for number formatting.
     CNumericLocalesSetter locales_setter;
     _BBS_3MF_Importer importer;
+    // Some callers (e.g. Model::read_from_file for "Replace with STL" given a .3mf) pass null out-params; use locals then.
+    PlateDataPtrs             local_plates;
+    std::vector<Preset*>      local_presets;
+    Semver                    local_version;
+    ConfigSubstitutionContext local_substitutions{ForwardCompatibilitySubstitutionRule::Enable};
+    const bool own_plates  = plate_data_list == nullptr;
+    const bool own_presets = project_presets == nullptr;
+    if (own_plates) plate_data_list = &local_plates;
+    if (own_presets) project_presets = &local_presets;
+    if (file_version == nullptr) file_version = &local_version;
+    if (config_substitutions == nullptr) config_substitutions = &local_substitutions;
+    ScopeGuard free_locals([&]() {
+        if (own_plates) release_PlateData_list(local_plates);
+        if (own_presets) { for (Preset *p : local_presets) delete p; local_presets.clear(); }
+    });
     bool res = importer.load_model_from_file(path, *model, *plate_data_list, *project_presets, *config, *config_substitutions, strategy, is_bbl_3mf, *file_version, proFn, project, plate_id);
     importer.log_errors();
 

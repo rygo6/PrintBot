@@ -4889,34 +4889,13 @@ void PartPlateList::release_icon_textures()
 	PartPlateList::is_load_bedtype_textures = false;
     PartPlateList::is_load_extruder_only_area_textures = false;
 	PartPlateList::is_load_cali_texture = false;
-	for (int i = 0; i < btCount; i++) {
-		for (auto& part: bed_texture_info[i].parts) {
-			if (part.texture) {
-				part.texture->reset();
-				delete part.texture;
-			}
-			if (part.vbo_id != 0) {
-				glsafe(::glDeleteBuffers(1, &part.vbo_id));
-				part.vbo_id = 0;
-			}
-			if (part.buffer) {
-				delete part.buffer;
-			}
-		}
-	}
-    for (int i = 0; i < (unsigned char)ExtruderOnlyAreaType::btAreaCount; i++) {
-        for (auto &part : extruder_only_area_info[i].parts) {
-            if (part.texture) {
-                part.texture->reset();
-                delete part.texture;
-            }
-            if (part.vbo_id != 0) {
-                glsafe(::glDeleteBuffers(1, &part.vbo_id));
-                part.vbo_id = 0;
-            }
-            if (part.buffer) { delete part.buffer; }
-        }
-    }
+	// TexturePart::reset() frees the texture, VBO and buffer and nulls the pointers, so a later
+	// init_*_info() -> reset() does not double-delete.
+	for (int i = 0; i < btCount; i++)
+		bed_texture_info[i].reset();
+    for (int i = 0; i < (unsigned char)ExtruderOnlyAreaType::btAreaCount; i++)
+        extruder_only_area_info[i].reset();
+    cali_texture_info.reset();
 }
 
 Vec2d PartPlateList::get_machine_default_wipe_tower_pos() const
@@ -7656,10 +7635,12 @@ void PartPlateList::BedTextureInfo::TexturePart::reset()
     if (texture) {
         texture->reset();
         delete texture;
+        texture = nullptr;
     }
+    release_vbo();
     if (buffer) {
-        release_vbo();
         delete buffer;
+        buffer = nullptr;
     }
 }
 
@@ -8031,6 +8012,9 @@ void PartPlateList::load_extruder_only_area_textures() {
 void PartPlateList::init_cali_texture_info()
 {
 	BedTextureInfo::TexturePart cali_line(18, 2, 224, 16, "bbl_cali_lines.svg");
+	// Re-init (after release_icon_textures) must not keep appending parts or leak old textures.
+	cali_texture_info.reset();
+	cali_texture_info.parts.clear();
 	cali_texture_info.parts.push_back(cali_line);
 
 	for (int j = 0; j < cali_texture_info.parts.size(); j++) {
@@ -8045,7 +8029,7 @@ void PartPlateList::load_cali_textures()
 	init_cali_texture_info();
 	GLint max_tex_size = OpenGLManager::get_gl_info().get_max_tex_size();
 	GLint logo_tex_size = (max_tex_size < 2048) ? max_tex_size : 2048;
-	for (int i = 0; i < (unsigned int)btCount; ++i) {
+	{ // one texture per part (this used to loop btCount times, leaking all but the last)
 		for (int j = 0; j < cali_texture_info.parts.size(); j++) {
 			std::string filename = resources_dir() + "/images/" + cali_texture_info.parts[j].filename;
 			if (boost::filesystem::exists(filename)) {

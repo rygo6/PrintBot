@@ -1,4 +1,5 @@
 #include "NotificationManager.hpp"
+#include <cmath>
 #include "GLCanvas3D.hpp"
 #include "Plater.hpp"
 
@@ -774,6 +775,9 @@ void NotificationManager::PopNotification::render_text(ImGuiWrapper& imgui, cons
 void NotificationManager::PopNotification::render_hypertext(
     ImGuiWrapper &imgui, const float text_x, const float text_y, const std::string text, bool more, bool use_second_callback)
 {
+	// A degenerate (tiny/zero-size) canvas can produce NaN or huge text positions; ImGui floors them to int (UB).
+	if (!std::isfinite(text_x) || !std::isfinite(text_y) || std::abs(text_x) > 1e6f || std::abs(text_y) > 1e6f)
+		return;
 	//invisible button
 	ImVec2 part_size = ImGui::CalcTextSize(text.c_str());
 	ImGui::SetCursorPosX(text_x -4);

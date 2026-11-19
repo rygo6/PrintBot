@@ -35,6 +35,12 @@ std::string                      gui_instructions();
 // finishing (the action then completes once the dialog is answered), "ui.timeout" after
 // timeout_s, and rethrows exceptions from fn.
 nlohmann::json run_on_main(std::function<nlohmann::json()> fn, double timeout_s = 120.0);
+// Re-entrancy policy for run_on_main calls made by the current (worker) thread. A queued call
+// is executed by whatever event loop the main thread is running, including the nested loop of
+// a modal dialog. Unless the tool may nest (read-only tools and the dialog tools that answer
+// such dialogs), run_on_main refuses with "ui.blocked_by_dialog" while a modal dialog is shown
+// and with "ui.busy" while another MCP call is still running on the main thread.
+void set_tool_may_nest(bool may_nest);
 // Posts fn to the main thread without waiting.
 void post_to_main(std::function<void()> fn);
 

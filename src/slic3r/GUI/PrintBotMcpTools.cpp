@@ -30,6 +30,8 @@
 #include <wx/checkbox.h>
 #include <wx/choice.h>
 #include <wx/combobox.h>
+#include <wx/dcmemory.h>
+#include <wx/dcscreen.h>
 #include <wx/dialog.h>
 #include <wx/image.h>
 #include <wx/radiobut.h>
@@ -47,6 +49,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 
@@ -96,6 +99,37 @@ namespace core = printbot::core;
 
 namespace {
 
+// Enforce the option's min/max like the settings panel does. Without this an agent could set e.g. wall_loops = 99999
+// (max 1000), which overflows int math in the slicer.
+void check_option_range(const ConfigBase &cfg, const std::string &key, const char *code)
+{
+    const ConfigOptionDef *def = print_config_def.get(key);
+    const ConfigOption    *opt = cfg.option(key);
+    if (def == nullptr || opt == nullptr) return;
+    if (def->min == ConfigOptionDef::min_default && def->max == ConfigOptionDef::max_default) return;
+    auto check = [&](double v) {
+        if (std::isnan(v) || v < def->min || v > def->max) {
+            std::string range = "[" + (def->min == ConfigOptionDef::min_default ? std::string("-inf") : float_to_string_decimal_point(def->min)) + ", " +
+                                (def->max == ConfigOptionDef::max_default ? std::string("inf") : float_to_string_decimal_point(def->max)) + "]";
+            throw ToolError{code, key + ": value " + float_to_string_decimal_point(v) + " is outside the allowed range " + range};
+        }
+    };
+    switch (opt->type()) {
+    case coInt: check(double(static_cast<const ConfigOptionInt *>(opt)->value)); break;
+    case coFloat: check(static_cast<const ConfigOptionFloat *>(opt)->value); break;
+    case coFloatOrPercent:
+        if (!static_cast<const ConfigOptionFloatOrPercent *>(opt)->percent) check(static_cast<const ConfigOptionFloatOrPercent *>(opt)->value);
+        break;
+    case coInts:
+        for (int v : static_cast<const ConfigOptionInts *>(opt)->values) check(double(v));
+        break;
+    case coFloats:
+        for (double v : static_cast<const ConfigOptionFloats *>(opt)->values) check(v);
+        break;
+    default: break;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // basics
 
@@ -130,8 +164,12 @@ void require_policy(const char *what)
 int plate_index_arg(const json &a, const char *key, bool required = false)
 {
     long long n = int_arg(a, key, required, 0);
-    if (n == 0) return -1; // not given: current plate
     PartPlateList &pl = plater().get_partplate_list();
+    if (n == 0) {
+        // A required plate must be a real 1-based number; an omitted optional one means "current plate".
+        if (required) bad_arg(std::string("'") + key + "' must be a plate number from 1 to " + std::to_string(pl.get_plate_count()));
+        return pl.get_curr_plate_index();
+    }
     if (n < 1 || n > pl.get_plate_count()) bad_arg("plate " + std::to_string(n) + " does not exist (there are " + std::to_string(pl.get_plate_count()) + ")");
     return int(n - 1);
 }
@@ -258,7 +296,9 @@ json plate_json(int i, bool with_slice = true)
 {
     Plater        &p     = plater();
     PartPlateList &pl    = p.get_partplate_list();
+    if (i < 0) i = pl.get_curr_plate_index();
     PartPlate     *plate = pl.get_plate(i);
+    if (!plate) throw ToolError{"plate.not_found", "plate " + std::to_string(i + 1) + " does not exist"};
     json           j;
     j["plate"]          = i + 1;
     j["name"]           = plate->get_plate_name();
@@ -805,9 +845,20 @@ json slice(ToolContext &ctx, const json &a)
         if (!all) {
             bool fits = false, invalid = false;
             p.validate_current_plate(fits, invalid);
-            if (!fits || invalid)
+            if (!fits || invalid) {
+                // Name the validation error when there is one (the app shows it as a notification).
+                std::string why;
+                if (invalid) {
+                    StringObjectException err = p.get_partplate_list().get_current_fff_print().validate();
+                    if (!err.string.empty()) {
+                        p.post_process_string_object_exception(err);
+                        why = ": " + err.string + (err.opt_key.empty() ? std::string() : " (setting '" + err.opt_key + "')");
+                    }
+                }
+                if (!why.empty()) throw ToolError{"slice.invalid_plate", "the plate cannot be sliced" + why};
                 throw ToolError{"slice.invalid_plate", "the plate cannot be sliced: an object is outside the printable area or the plate has errors "
                                                        "(see the notifications in the app; list_objects shows outside_print_volume)"};
+            }
         }
         wxPostEvent(&p, SimpleEvent(all ? EVT_GLTOOLBAR_SLICE_ALL : EVT_GLTOOLBAR_SLICE_PLATE));
         wxGetApp().mainframe->select_tab(size_t(MainFrame::tpPreview));
@@ -819,7 +870,9 @@ json slice(ToolContext &ctx, const json &a)
     bool       seen    = false;
     double     last_pg = -1;
     while (true) {
-        json st = on_main([all]() {
+        json st;
+        try {
+            st = on_main([all]() {
             Plater        &p     = plater();
             PartPlateList &pl    = p.get_partplate_list();
             int            total = 0, done = 0;
@@ -831,7 +884,18 @@ json slice(ToolContext &ctx, const json &a)
                 if (pp->is_slice_result_valid()) ++done;
             }
             return json{{"slicing", p.is_background_process_slicing()}, {"error_plate", p.slice_error_plate()}, {"total", total}, {"done", done}};
-        }, 30);
+            }, 30);
+        } catch (const ToolError &e) {
+            // Slicing/export failed and the app is showing its error dialog: report that as the slice result.
+            if (e.code == "ui.blocked_by_dialog") {
+                std::string what = e.message;
+                if (auto i = what.find("dialog: "); i != std::string::npos) what = what.substr(i + 8);
+                if (auto i = what.find(". "); i != std::string::npos) what = what.substr(0, i);
+                throw ToolError{"slice.error", "slicing stopped with an error; the app shows it in a dialog: " + what +
+                                                   " (read it with ui_dialog_inspect, close it with ui_close_dialog)"};
+            }
+            throw;
+        }
         const bool slicing = st["slicing"].get<bool>();
         seen               = seen || slicing;
         int         completed, status;
@@ -853,6 +917,15 @@ json slice(ToolContext &ctx, const json &a)
         if (!slicing && st["error_plate"].get<int>() >= 0 && (seen || completed > 0))
             throw ToolError{"slice.error", err.empty() ? "slicing failed on plate " + std::to_string(st["error_plate"].get<int>() + 1) + " (see the app's notifications)" : err};
         if (!slicing && total > 0 && done == total && (seen || completed > 0 || el > 3.0)) break;
+        // Nothing started: the background process had no work (e.g. the previous attempt failed during G-code export
+        // and nothing changed since) or refused to start. Report it instead of waiting for the whole timeout.
+        if (!slicing && !seen && completed == 0 && el > 8.0) {
+            if (st["error_plate"].get<int>() >= 0)
+                throw ToolError{"slice.error", "plate " + std::to_string(st["error_plate"].get<int>() + 1) +
+                                                   " failed to slice earlier and nothing has changed since; fix the cause (see the app's notifications, "
+                                                   "e.g. a G-code template error) and slice again"};
+            throw ToolError{"slice.not_started", "slicing did not start (see the app's notifications for the reason)"};
+        }
         if (el > timeout) throw ToolError{"slice.timeout", "slicing did not finish within " + std::to_string(int(timeout)) + " s (still running in the app)"};
         sleep_ms(300);
     }
@@ -1436,6 +1509,20 @@ struct Reg
                 return inner(ctx, a);
             };
         }
+        // Read-only tools, the dialog tools (they answer the dialog another call is waiting in) and
+        // the print tools (own gate, may wait on their own dialog) may run while a modal dialog is
+        // shown; every other tool is refused instead of running nested in that dialog's event loop.
+        static const std::set<std::string> nest_ok{"ui_list_dialogs", "ui_dialog_inspect", "ui_dialog_click", "ui_dialog_set",
+                                                   "ui_close_dialog",  "ui_screenshot",     "print_plate",     "get_print_operation",
+                                                   "printer_control"};
+        const bool may_nest = read_only || nest_ok.count(name) > 0;
+        {
+            auto inner = std::move(h);
+            h          = [may_nest, inner](ToolContext &ctx, const json &a) {
+                set_tool_may_nest(may_nest);
+                return inner(ctx, a);
+            };
+        }
         t.push_back(Tool{std::move(name), std::move(title), std::move(desc), std::move(schema), read_only, std::move(h)});
     }
 };
@@ -1614,6 +1701,7 @@ std::vector<Tool> make_gui_tools()
                         throw ToolError{"preset.bad_value", key + ": " + e.what()};
                     }
                     if (!ok) throw ToolError{"preset.bad_value", "invalid value '" + v + "' for " + key};
+                    check_option_range(cfg, key, "preset.bad_value");
                 }
                 tab->load_config(cfg);
                 plater().on_config_change(bundle().full_config());
@@ -1822,6 +1910,14 @@ std::vector<Tool> make_gui_tools()
             }
             if (scale && scale->minCoeff() <= 0) bad_arg("'scale' must be positive");
             if (size && *std::min_element(size->begin(), size->end()) <= 0) bad_arg("'size_mm' must be positive");
+            // Keep geometry within the slicer's 32-bit coordinate range (about +-21 m); beyond that the clipper overflows.
+            auto too_far = [](const std::optional<std::vector<double>> &v, double lim) {
+                if (v) for (double x : *v) if (!std::isfinite(x) || std::abs(x) > lim) return true;
+                return false;
+            };
+            if (too_far(position, 5000.) || too_far(move_by, 5000.)) bad_arg("'position'/'move_by' must be within +-5000 mm");
+            if (too_far(size, 5000.)) bad_arg("'size_mm' must be at most 5000 mm");
+            if (scale && (!scale->allFinite() || scale->maxCoeff() > 1000.)) bad_arg("'scale' must be at most 1000");
             return on_main([=]() {
                 Plater     &p      = plater();
                 const int   idx    = object_index(id);
@@ -1898,6 +1994,7 @@ std::vector<Tool> make_gui_tools()
                     DynamicPrintConfig tmp;
                     const std::string  v = it->is_string() ? it->get<std::string>() : it->dump();
                     if (!tmp.set_deserialize_nothrow(key, v, sctx)) throw ToolError{"object.bad_value", "invalid value '" + v + "' for " + key};
+                    check_option_range(tmp, key, "object.bad_value");
                     o->config.set_key_value(key, tmp.option(key)->clone());
                 }
                 wxGetApp().obj_list()->update_and_show_object_settings_item();
@@ -2507,7 +2604,7 @@ std::vector<Tool> make_gui_tools()
                 return json{{"path", path}, {"width", shot->w}, {"height", shot->h}, {"target", "canvas"}};
             }
             if (target != "window" && target != "dialog") bad_arg("'target' must be canvas, window or dialog");
-            return on_main([=]() {
+            return on_main([=]() -> json {
                 wxWindow *w = wxGetApp().mainframe;
                 if (target == "dialog") w = find_dialog(a);
 #ifdef __WXGTK__
@@ -2537,8 +2634,21 @@ std::vector<Tool> make_gui_tools()
                     throw ToolError{"ui.screenshot_failed", m};
                 }
                 return json{{"path", path}, {"width", ww}, {"height", hh}, {"target", target}};
+#elif defined(__WXMSW__)
+                if (!w) throw ToolError{"ui.screenshot_failed", "no window to capture"};
+                // Copy the screen area under the window, so dialogs and popups on top of it are included.
+                const wxRect r = w->GetScreenRect();
+                if (r.width <= 0 || r.height <= 0) throw ToolError{"ui.screenshot_failed", "the window has no size"};
+                wxBitmap bmp(r.width, r.height, 24);
+                {
+                    wxScreenDC sdc;
+                    wxMemoryDC mdc(bmp);
+                    mdc.Blit(0, 0, r.width, r.height, &sdc, r.x, r.y);
+                }
+                if (!bmp.ConvertToImage().SaveFile(wx(path), wxBITMAP_TYPE_PNG)) throw ToolError{"ui.screenshot_failed", "could not write " + path};
+                return json{{"path", path}, {"width", r.width}, {"height", r.height}, {"target", target}};
 #else
-                throw ToolError{"ui.unsupported", "window screenshots are only implemented on Linux"};
+                throw ToolError{"ui.unsupported", "window screenshots are only implemented on Linux and Windows"};
 #endif
             });
         });

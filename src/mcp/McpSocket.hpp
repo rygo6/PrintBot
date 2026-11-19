@@ -1,11 +1,13 @@
 // print_bot MCP: local socket transport. The running print_bot app listens on a Unix domain
 // socket (only the user can connect: the socket dir is 0700 and the socket 0600), and
 // print_bot-mcp bridges an MCP client's stdio to it, so tool calls act on the live app and
-// the user sees every change. GUI-free (no wxWidgets). POSIX only for now.
+// the user sees every change. GUI-free (no wxWidgets). On Windows the socket is a Winsock AF_UNIX socket in
+// %LOCALAPPDATA%\\PrintBot, and peers must run as the same user.
 #ifndef printbot_mcp_McpSocket_hpp_
 #define printbot_mcp_McpSocket_hpp_
 
 #include <atomic>
+#include <cstdio>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -16,11 +18,15 @@
 
 namespace printbot::mcp {
 
-// $PRINTBOT_MCP_SOCKET, else $XDG_RUNTIME_DIR/print_bot/mcp.sock, else <tmp>/print_bot-<uid>/mcp.sock.
+// $PRINTBOT_MCP_SOCKET, else $XDG_RUNTIME_DIR/print_bot/mcp.sock, else <tmp>/print_bot-<uid>/mcp.sock
+// (Windows: %LOCALAPPDATA%\\PrintBot\\mcp.sock).
 std::string default_socket_path();
 
 // Connects to a listening socket. Returns the fd, or -1 (errno set) if nobody listens there.
 int connect_socket(const std::string &path);
+
+// Closes a socket returned by connect_socket().
+void close_socket(int fd);
 
 // Relays bytes between an MCP client (in_fd/out_fd, e.g. stdin/stdout) and a connected socket
 // until the socket closes. Returns 0 on a clean end.
@@ -38,6 +44,21 @@ protected:
 private:
     int  m_fd;
     char m_buf[16384];
+};
+
+// A stdio FILE* whose writes go to a connected socket (POSIX: fdopen of a dup; Windows: a CRT pipe
+// pumped into the socket by a thread). close() flushes and waits until everything is sent.
+class SocketWriter
+{
+public:
+    ~SocketWriter() { close(); }
+    bool       open(int sock);
+    void       close();
+    std::FILE *file() const { return m_file; }
+
+private:
+    std::FILE  *m_file = nullptr;
+    std::thread m_pump;
 };
 
 class SocketListener

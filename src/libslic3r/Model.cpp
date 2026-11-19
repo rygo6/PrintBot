@@ -1,3 +1,4 @@
+#include <cmath>
 #include "Model.hpp"
 #include "libslic3r.h"
 #include "BuildVolume.hpp"
@@ -219,6 +220,24 @@ Model::~Model()
         Slic3r::remove_backup(*this, true);
 }
 
+// Reject models with NaN / infinite coordinates (corrupt STL/OBJ/3MF): they poison bounding
+// boxes, hulls, arrangement and slicing further down.
+static void throw_if_non_finite(const Model &model)
+{
+    for (const ModelObject *o : model.objects) {
+        for (const ModelVolume *v : o->volumes) {
+            for (const stl_vertex &p : v->mesh().its.vertices)
+                if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z()))
+                    throw Slic3r::RuntimeError(_L("The model contains invalid vertex coordinates (NaN or infinite) and cannot be loaded."));
+            if (!v->get_matrix().matrix().allFinite())
+                throw Slic3r::RuntimeError(_L("The model contains an invalid transformation (NaN or infinite) and cannot be loaded."));
+        }
+        for (const ModelInstance *i : o->instances)
+            if (!i->get_matrix().matrix().allFinite())
+                throw Slic3r::RuntimeError(_L("The model contains an invalid transformation (NaN or infinite) and cannot be loaded."));
+    }
+}
+
 Model Model::read_from_step(const std::string&                                      input_file,
                             LoadStrategy                                            options,
                             ImportStepProgressFn                                    stepFn,
@@ -267,6 +286,8 @@ _finished:
 
     if (model.objects.empty())
         throw Slic3r::RuntimeError(_L("The supplied file couldn't be read because it's empty"));
+
+    throw_if_non_finite(model);
 
     for (ModelObject *o : model.objects)
         o->input_file = input_file;
@@ -454,6 +475,8 @@ Model Model::read_from_file(const std::string&                                  
     if (model.objects.empty())
         throw Slic3r::RuntimeError(_L("The supplied file couldn't be read because it's empty"));
 
+    throw_if_non_finite(model);
+
     for (ModelObject *o : model.objects)
         o->input_file = input_file;
 
@@ -507,6 +530,8 @@ Model Model::read_from_archive(const std::string& input_file, DynamicPrintConfig
 
     if (!result)
         throw Slic3r::RuntimeError(_L("Loading of a model file failed."));
+
+    throw_if_non_finite(model);
 
     for (ModelObject *o : model.objects) {
 //        if (boost::algorithm::iends_with(input_file, ".zip.amf"))
@@ -720,6 +745,11 @@ void Model::collect_reusable_objects(std::vector<ObjectBase*>& objects)
                        std::back_inserter(model_object->volume_ids),
                        std::mem_fn(&ObjectBase::id));
         model_object->volumes.clear();
+        // Instances too: loading a snapshot overwrites model_object->instances, so instances not offered for
+        // reuse here were leaked on every undo/redo. Unused ones are deleted by the undo stack after loading.
+        for (ModelInstance* model_instance : model_object->instances)
+            objects.push_back(model_instance);
+        model_object->instances.clear();
     }
     // we never own these objects
     this->objects.clear();
@@ -3607,7 +3637,10 @@ int ModelVolume::get_repaired_errors_count() const
 
 const TriangleMesh& ModelVolume::get_convex_hull() const
 {
-    return *m_convex_hull.get();
+    // The hull can be missing (e.g. a volume restored from a broken project); callers treat an
+    // empty hull as "use the mesh instead".
+    static const TriangleMesh empty_hull;
+    return m_convex_hull ? *m_convex_hull : empty_hull;
 }
 
 //BBS: refine the model part names

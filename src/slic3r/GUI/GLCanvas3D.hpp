@@ -377,8 +377,12 @@ class GLCanvas3D
         bool is_start_position_3D_defined() const { return (drag.start_position_3D != Drag::Invalid_3D_Point); }
         bool is_move_start_threshold_position_2D_defined() const { return (drag.move_start_threshold_position_2D != Drag::Invalid_2D_Point); }
         bool is_move_threshold_met(const Point& mouse_pos) const {
-            return (std::abs(mouse_pos(0) - drag.move_start_threshold_position_2D(0)) > Drag::MoveThresholdPx)
-                || (std::abs(mouse_pos(1) - drag.move_start_threshold_position_2D(1)) > Drag::MoveThresholdPx);
+            // No threshold start recorded (Invalid_2D_Point sentinel): treat as met, as before,
+            // without the int overflow of subtracting the INT_MAX sentinel.
+            if (!is_move_start_threshold_position_2D_defined())
+                return true;
+            return (std::abs(int64_t(mouse_pos(0)) - int64_t(drag.move_start_threshold_position_2D(0))) > Drag::MoveThresholdPx)
+                || (std::abs(int64_t(mouse_pos(1)) - int64_t(drag.move_start_threshold_position_2D(1))) > Drag::MoveThresholdPx);
         }
     };
 

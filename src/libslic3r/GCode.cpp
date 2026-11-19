@@ -1824,6 +1824,11 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     if (print->is_step_done(psGCodeExport) && boost::filesystem::exists(boost::filesystem::path(path)))
         return;
 
+    // Nothing printable (e.g. every object was dropped as invalid): fail cleanly instead of
+    // dereferencing objects().front() further down.
+    if (print->objects().empty())
+        throw Slic3r::SlicingError(_(L("Nothing to print: there are no printable objects on this plate.")));
+
     BOOST_LOG_TRIVIAL(info) << boost::format("Will export G-code to %1% soon") % PathSanitizer::sanitize(path);
 
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_Printer();
@@ -3657,10 +3662,10 @@ void GCode::process_layers(
         this->m_spiral_vase->set_max_xy_smoothing(max_xy_smoothing);
     }
     const auto spiral_mode = tbb::make_filter<GCode::LayerResult, GCode::LayerResult>(
-        slic3r_tbb_filtermode::serial_in_order, [&spiral_mode = *this->m_spiral_vase.get(), & layers_to_print](GCode::LayerResult in) -> GCode::LayerResult {
-            spiral_mode.enable(in.spiral_vase_enable);
+        slic3r_tbb_filtermode::serial_in_order, [spiral_mode = this->m_spiral_vase.get(), & layers_to_print](GCode::LayerResult in) -> GCode::LayerResult {
+            spiral_mode->enable(in.spiral_vase_enable);
             bool last_layer = in.layer_id == layers_to_print.size() - 1;
-            return {spiral_mode.process_layer(std::move(in.gcode), last_layer), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush, in.gcode_store_pos};
+            return {spiral_mode->process_layer(std::move(in.gcode), last_layer), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush, in.gcode_store_pos};
         });
 
     std::vector<std::vector<PerExtruderAdjustments>> layers_extruder_adjustments(layers_to_print.size());
@@ -3796,10 +3801,10 @@ void GCode::process_layers(
         this->m_spiral_vase->set_max_xy_smoothing(max_xy_smoothing);
     }
     const auto spiral_mode = tbb::make_filter<GCode::LayerResult, GCode::LayerResult>(
-        slic3r_tbb_filtermode::serial_in_order, [&spiral_mode = *this->m_spiral_vase.get(), &layers_to_print](GCode::LayerResult in) -> GCode::LayerResult {
-            spiral_mode.enable(in.spiral_vase_enable);
+        slic3r_tbb_filtermode::serial_in_order, [spiral_mode = this->m_spiral_vase.get(), &layers_to_print](GCode::LayerResult in) -> GCode::LayerResult {
+            spiral_mode->enable(in.spiral_vase_enable);
             bool last_layer = in.layer_id == layers_to_print.size() - 1;
-            return {spiral_mode.process_layer(std::move(in.gcode), last_layer), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush, in.gcode_store_pos};
+            return {spiral_mode->process_layer(std::move(in.gcode), last_layer), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush, in.gcode_store_pos};
         });
 
     //BBS: get objects and nodes info, for better arrange

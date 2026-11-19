@@ -3076,7 +3076,7 @@ void MainFrame::init_menubar_as_editor()
         };
 #else
     wxMenu* parent_menu = m_topbar->GetTopMenu();
-    auto preference_item = new wxMenuItem(parent_menu, ConfigMenuPreferences + config_id_base, _L("Preferences") + "\t" + ctrl + "P", "");
+    // (An unused "Preferences" wxMenuItem used to be created here and never appended to a menu, so it leaked.)
 
 #endif
     //auto printer_item = new wxMenuItem(parent_menu, ConfigMenuPrinter + config_id_base, _L("Printer"), "");
