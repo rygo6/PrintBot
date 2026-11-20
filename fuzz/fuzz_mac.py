@@ -176,14 +176,15 @@ def mcp_loop(m, tools, alog, stop, sb_out):
             alog.write(json.dumps({'k': 'mcp_dead', 'err': str(ex)}) + '\n'); return
         time.sleep(random.uniform(0.0, 1.0))
 
-FRAME_RE = re.compile(r'#\d+ 0x[0-9a-f]+ in (.+?) (/\S+?:\d+)(?::\d+)?\s*$', re.M)
+# macOS frames end in 'file.cpp:123' (no directory); Linux-style absolute paths are accepted too.
+FRAME_RE = re.compile(r'#\d+ 0x[0-9a-f]+ in (.+?) (\S+?\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|inl|mm|m):\d+)(?::\d+)?\s*$', re.M)
 def signatures(text):
     out = []
     starts = [x.start() for x in re.finditer(r'(?m)^(?:\S+:\d+:\d+: runtime error:|=+\n==\d+==ERROR:|==\d+==ERROR:)', text)] or ([0] if text.strip() else [])
     for blk in [text[a:b] for a, b in zip(starts, starts[1:] + [len(text)])]:
         m = re.search(r'ERROR: AddressSanitizer: ([\w\-]+)', blk)
         frames = [(f[-90:], l.replace(REPO + '/', '')) for f, l in FRAME_RE.findall(blk)]
-        own = [l for _, l in frames if l.startswith('src/')][:3]
+        own = [l for f, l in frames if not f.startswith('std::') and (l.startswith('src/') or '/' not in l)][:3]
         if m: out.append(('ASan ' + m.group(1), own or [l for _, l in frames[:3]], blk)); continue
         m = re.search(r'^(\S+?):(\d+):\d+: runtime error: (.*)$', blk, re.M)
         if m: out.append(('UBSan ' + m.group(3)[:120], [m.group(1).replace(REPO + '/', '') + ':' + m.group(2)], blk))
@@ -206,7 +207,10 @@ def main():
         env = {k: v for k, v in os.environ.items() if not k.startswith(('DYLD_', 'SSH_'))}
         env.update({'HOME': os.path.join(sb, 'home'), 'TMPDIR': os.path.join(sb, 'tmp') + '/', 'PRINTBOT_MCP_SOCKET': sock,
                     'ASAN_OPTIONS': f'abort_on_error=1:halt_on_error=1:symbolize=1:log_path={rundir}/asan:detect_leaks=0:'
-                                    f'allocator_may_return_null=1:detect_stack_use_after_return=0:print_summary=1',
+                                    f'allocator_may_return_null=1:detect_stack_use_after_return=0:print_summary=1:'
+                                    # The static deps are not instrumented and share libc++ vector instantiations with the
+                                    # app (ODR), which leaves libc++'s container annotations stale: false overflow reports.
+                                    f'detect_container_overflow=0',
                     'UBSAN_OPTIONS': f'print_stacktrace=1:halt_on_error=0:log_path={rundir}/ubsan:suppressions={cfg.SUPP}'})
         cmd = [APP, '--datadir', data]
         if not args.no_sandbox: cmd = ['sandbox-exec', '-p', SANDBOX] + cmd
@@ -255,7 +259,7 @@ def main():
                     uniq[key] = {'dir': cd, 'kind': kind, 'where': where, 'count': 0, 'runs': []}
                     log('NEW finding', kind, where)
                 uniq[key]['count'] += 1; uniq[key]['runs'].append(idx)
-        if crashed and not glob.glob(os.path.join(rundir, 'asan.*')):
+        if crashed and not glob.glob(os.path.join(rundir, 'asan.*')) + glob.glob(os.path.join(rundir, 'ubsan.*')):
             log(f'run {idx}: exit rc={rc} without a sanitizer report (see {rundir}/app.log)')
         log(f'run {idx} ended rc={rc} mcp={stats["mcp_calls"]}')
         json.dump(uniq, open(os.path.join(CRASHES, 'uniq.json'), 'w'), indent=1)

@@ -90,7 +90,7 @@ The macOS build uses Apple clang with `-fsanitize=address,undefined`. LeakSaniti
 silicon, so macOS runs check for memory errors and UB only.
 
 ```sh
-./BuildMac.sh -d -x                       # deps, once
+./BuildMac.sh -d -x                       # deps, once (includes a static GLEW; Homebrew's GLEW is not used)
 fuzz/build_asan_mac.sh                    # -> build-asan/src/BambuStudio.app and print_bot-mcp
 python3 fuzz/gen_corpus.py
 python3 fuzz/fuzz_mac.py --minutes 45 --tag mac
@@ -102,4 +102,6 @@ python3 fuzz/fuzz_mac.py --minutes 45 --tag mac
 - Each run gets its own `--datadir`, `HOME`, `TMPDIR` and MCP socket. The app runs under `sandbox-exec` with all
   IP networking denied (Unix sockets still work), so it cannot reach printers or cloud services. No sudo is
   needed.
+- The deps are not built with sanitizers and share libc++ template instantiations with the app, so libc++
+  container-overflow checks give false reports; `fuzz_mac.py` runs with `detect_container_overflow=0`.
 - Output layout matches the Linux fuzzer: `temp/fuzz/crashes_<tag>/`, `stats_<tag>.json`, `progress_<tag>.txt`.

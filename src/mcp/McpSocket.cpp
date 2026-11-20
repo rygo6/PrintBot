@@ -343,6 +343,53 @@ bool fill_addr(const std::string &path, sockaddr_un &addr)
     return true;
 }
 
+// AF_UNIX stream socket with close-on-exec (SOCK_CLOEXEC is Linux/BSD only; macOS needs fcntl).
+int new_unix_socket()
+{
+#ifdef SOCK_CLOEXEC
+    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd >= 0) ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+#ifdef SO_NOSIGPIPE
+    // macOS has no MSG_NOSIGNAL: a write to a closed peer must not kill the process.
+    if (fd >= 0) { int one = 1; ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
+#endif
+    return fd;
+}
+
+int accept_cloexec(int listen_fd)
+{
+#ifdef __linux__
+    return ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+#else
+    int c = ::accept(listen_fd, nullptr, nullptr);
+    if (c >= 0) {
+        ::fcntl(c, F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        ::setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+    }
+    return c;
+#endif
+}
+
+// True if the connected peer runs as the same user as this process.
+bool peer_is_same_user(int c)
+{
+#ifdef __linux__
+    struct ucred cred;
+    socklen_t    len = sizeof(cred);
+    return ::getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 && cred.uid == ::getuid();
+#else
+    uid_t uid = 0;
+    gid_t gid = 0;
+    return ::getpeereid(c, &uid, &gid) == 0 && uid == ::getuid();
+#endif
+}
+
 bool write_all(int fd, const char *data, size_t len)
 {
     while (len > 0) {
@@ -366,7 +413,7 @@ int connect_socket(const std::string &path)
         errno = ENAMETOOLONG;
         return -1;
     }
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = new_unix_socket();
     if (fd < 0) return -1;
     if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
         int e = errno;
@@ -474,7 +521,7 @@ bool SocketListener::start(const std::string &path, Handler handler, std::string
     }
     ::unlink(path.c_str()); // stale socket from a crashed instance
 
-    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = new_unix_socket();
     if (fd < 0) {
         error = std::string("socket(): ") + std::strerror(errno);
         return false;
@@ -502,12 +549,10 @@ void SocketListener::accept_loop()
         pollfd p{m_listen_fd, POLLIN, 0};
         int    n = ::poll(&p, 1, 250);
         if (n <= 0) continue;
-        int c = ::accept4(m_listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+        int c = accept_cloexec(m_listen_fd);
         if (c < 0) continue;
         // Only the same user may talk to the app.
-        struct ucred cred;
-        socklen_t    len = sizeof(cred);
-        if (::getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.uid != ::getuid()) {
+        if (!peer_is_same_user(c)) {
             ::close(c);
             continue;
         }

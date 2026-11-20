@@ -64,7 +64,13 @@ This module defines the following variables:
 
 include(FindPackageHandleStandardArgs)
 
-find_package(GLEW CONFIG QUIET)
+if (APPLE AND GLEW_USE_STATIC_LIBS)
+  # Use the deps build's static GLEW. A Homebrew GLEW config package has no static target and fails hard
+  # when GLEW_USE_STATIC_LIBS is set, so only look for a config package in CMAKE_PREFIX_PATH.
+  find_package(GLEW CONFIG QUIET NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_SYSTEM_PATH NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PACKAGE_REGISTRY)
+else ()
+  find_package(GLEW CONFIG QUIET)
+endif ()
 
 if(GLEW_FOUND)
   find_package_handle_standard_args(GLEW DEFAULT_MSG GLEW_CONFIG)

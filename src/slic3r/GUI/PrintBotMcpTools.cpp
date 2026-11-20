@@ -2648,7 +2648,7 @@ std::vector<Tool> make_gui_tools()
                 if (!bmp.ConvertToImage().SaveFile(wx(path), wxBITMAP_TYPE_PNG)) throw ToolError{"ui.screenshot_failed", "could not write " + path};
                 return json{{"path", path}, {"width", r.width}, {"height", r.height}, {"target", target}};
 #else
-                throw ToolError{"ui.unsupported", "window screenshots are only implemented on Linux and Windows"};
+                throw ToolError{"ui.unsupported", "window and dialog screenshots are only implemented on Linux and Windows; use target=canvas"};
 #endif
             });
         });

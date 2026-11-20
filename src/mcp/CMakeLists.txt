@@ -17,6 +17,7 @@ target_link_libraries(printbot_slic3r_support PUBLIC libslic3r libcurl OpenSSL::
 add_executable(print_bot_mcp main.cpp)
 set_target_properties(print_bot_mcp PROPERTIES
     OUTPUT_NAME "print_bot-mcp"
+    MACOSX_BUNDLE OFF   # a plain command-line relay, also when CMAKE_MACOSX_BUNDLE=ON (macOS app builds)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/..")
 target_link_libraries(print_bot_mcp printbot_mcp printbot_slic3r_support)
 if (NOT WIN32)

@@ -326,9 +326,12 @@ set(_dep_list
     ${FFMPEG_PKG}
     )
 
-if (MSVC)
-    # The app links GLEW; Windows has no system copy to fall back on.
+if (MSVC OR APPLE)
+    # The app links GLEW statically; Windows and macOS have no usable system copy (Homebrew's is shared only).
     list(APPEND _dep_list "dep_GLEW")
+endif ()
+
+if (MSVC)
     # Experimental
     #list(APPEND _dep_list "dep_qhull")
 else()

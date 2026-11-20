@@ -1,6 +1,6 @@
 # Fuzzing status
 
-Last updated: 2026-11-18. Harness and usage: [README.md](README.md).
+Last updated: 2026-11-19. Harness and usage: [README.md](README.md).
 
 ## Summary
 
@@ -11,7 +11,8 @@ Last updated: 2026-11-18. Harness and usage: [README.md](README.md).
   leak-mode repro found 0 repo-owned leaks; everything reported came from wx/GTK/fontconfig/GL driver code.
 - Windows (MSVC `/fsanitize=address`): the build and a smoke run work. Windows fuzzing is partial (see Open
   items).
-- macOS (Apple clang ASan+UBSan): harness added (`fuzz_mac.py`, `build_asan_mac.sh`), see the macOS section.
+- macOS (Apple clang ASan+UBSan): builds after the fixes in the macOS section; a 45 min MCP-driven pass found
+  0 crashes and 0 sanitizer reports.
 
 ## Builds
 
@@ -160,9 +161,29 @@ All of these are fixed and verified with `repro.py` unless noted.
 
 ## macOS
 
-`fuzz_mac.py` drives the app only through MCP (no synthesized global input) under `sandbox-exec` with IP
-networking denied, and `build_asan_mac.sh` configures the Apple clang ASan+UBSan build. LeakSanitizer is not
-available on Apple silicon. No macOS fuzz results are recorded yet.
+**Build** (`build_asan_mac.sh`): Apple clang 21, `Release`, `-fsanitize=address,undefined`, arm64, deps from
+`BuildMac.sh -d -x`. Getting the tree to build on macOS needed these fixes:
+- The `print_bot-mcp` relay became an app bundle under `CMAKE_MACOSX_BUNDLE=ON` and its `install()` failed at
+  configure time. It is now marked `MACOSX_BUNDLE OFF`. This also affected the normal `BuildMac.sh` build.
+- The MCP socket used Linux-only calls (`SOCK_CLOEXEC`, `accept4`, `SO_PEERCRED`). On macOS it now uses `fcntl`,
+  `accept`, `getpeereid` for the same-user check, and `SO_NOSIGPIPE`.
+- GLEW: the app links GLEW statically, and a Homebrew GLEW config package (shared only) made configure fail.
+  The deps now build GLEW on macOS too, and `FindGLEW` only accepts a config package from `CMAKE_PREFIX_PATH`
+  on macOS static builds.
+- The MPFR source mirror `ftp.vim.org` no longer resolves; it was replaced with `ftp.gnu.org`.
+
+**Fuzzing** (`fuzz_mac.py`, MCP only, `sandbox-exec` with IP networking denied, LeakSanitizer unavailable):
+
+| Campaign | Runs | MCP calls | Result |
+|---|---|---|---|
+| mac1 (stopped after 6 min) | 2 | 487 | ASan "heap-buffer-overflow" in `ToolOrdering::collect_extruder_statistics` on every slice: a false positive, see below |
+| mac2 (45 min) | 8 | 4034 | 0 crashes, 0 hangs, 0 sanitizer reports; 290 slices, 199 calls refused by the re-entrancy guard, 285 dialogs closed |
+
+The mac1 report was a read 4 bytes *inside* an 8-byte `vector<unsigned>`. The vector's
+`__insert_with_size` instantiation was linked from the uninstrumented `libassimp.a` (the deps are not built
+with sanitizers), and that copy does not update libc++'s ASan container annotations. A partially poisoned
+granule is reported as heap-buffer-overflow. The code is correct, so `fuzz_mac.py` runs with
+`detect_container_overflow=0`. The Linux build uses libstdc++, which has no such annotations.
 
 ## Open items
 
@@ -172,6 +193,7 @@ available on Apple silicon. No macOS fuzz results are recorded yet.
 2. **Windows fuzzing is partial.** The build and a smoke run (launch plus an MCP-driven slice) worked. The long
    pass stopped when the Windows test machine reset. The reset was a CPU machine-check (WHEA) hardware error,
    not PrintBot. No Windows findings have been recorded. Rerun `run_fuzz.cmd` on a stable machine.
-3. **macOS fuzzing has not run yet** (see above).
+3. **macOS coverage is MCP-only.** No synthesized mouse or keyboard input, and no leak checking (LeakSanitizer
+   is not available on Apple silicon).
 4. **Harness.** Run fuzzers and `repro.py` one at a time on a given display. Both wait for the X lock, but
    killing a run mid-way can leave a stale lock or a slow-exiting Xvfb.
